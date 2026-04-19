@@ -1,0 +1,35 @@
+[package]
+name = "claude-meter"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Live Claude plan usage and extra-usage balance from the terminal"
+repository = "https://github.com/m13v/claude-meter"
+readme = "README.md"
+keywords = ["claude", "anthropic", "usage", "cli"]
+categories = ["command-line-utilities"]
+
+[[bin]]
+name = "claude-meter"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+aes = "0.8"
+cbc = { version = "0.1", features = ["alloc", "block-padding"] }
+pbkdf2 = "0.12"
+sha1 = "0.10"
+rquest = { version = "5", features = ["json"] }
+rquest-util = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+dirs = "5"
+chrono = { version = "0.4", features = ["serde"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
