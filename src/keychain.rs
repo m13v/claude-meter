@@ -1,32 +1,41 @@
 use anyhow::{Context, Result};
 
+use crate::browser::Browser;
+
 #[cfg(target_os = "macos")]
-pub fn chrome_safe_storage_password() -> Result<Vec<u8>> {
+pub fn safe_storage_password(browser: Browser) -> Result<Vec<u8>> {
     // Shell out to `/usr/bin/security` rather than calling the Keychain API directly.
-    // Chrome Safe Storage's item ACL already trusts `/usr/bin/security`, so this skips
-    // the per-app approval dialog that would otherwise pop up for an unsigned binary.
+    // Chrome's Safe Storage item ACL already trusts `/usr/bin/security`, so Chrome skips
+    // the per-app approval dialog. Arc/Brave/Edge may still prompt once; after the user
+    // clicks "Always Allow" the same path works silently thereafter.
     let out = std::process::Command::new("/usr/bin/security")
-        .args(["find-generic-password", "-wa", "Chrome", "-s", "Chrome Safe Storage"])
+        .args([
+            "find-generic-password",
+            "-wa",
+            browser.keychain_account(),
+            "-s",
+            browser.keychain_service(),
+        ])
         .output()
         .context("spawn /usr/bin/security")?;
     if !out.status.success() {
         anyhow::bail!(
-            "`security find-generic-password` failed: {}",
+            "`security find-generic-password` failed for {}: {}",
+            browser.display_name(),
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
     let mut pw = out.stdout;
-    // Strip trailing newline from CLI output.
     while matches!(pw.last(), Some(b'\n') | Some(b'\r')) {
         pw.pop();
     }
     if pw.is_empty() {
-        anyhow::bail!("Chrome Safe Storage password was empty");
+        anyhow::bail!("{} Safe Storage password was empty", browser.display_name());
     }
     Ok(pw)
 }
 
 #[cfg(not(target_os = "macos"))]
-pub fn chrome_safe_storage_password() -> Result<Vec<u8>> {
-    anyhow::bail!("claude-meter v0.1 supports macOS only")
+pub fn safe_storage_password(_browser: Browser) -> Result<Vec<u8>> {
+    anyhow::bail!("claude-meter supports macOS only")
 }

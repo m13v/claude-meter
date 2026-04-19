@@ -9,10 +9,10 @@ pub struct Window {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ExtraUsage {
     pub is_enabled: bool,
-    pub monthly_limit: i64,
-    pub used_credits: f64,
-    pub utilization: f64,
-    pub currency: String,
+    pub monthly_limit: Option<i64>,
+    pub used_credits: Option<f64>,
+    pub utilization: Option<f64>,
+    pub currency: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -59,8 +59,10 @@ pub struct SubscriptionResponse {
 #[derive(Debug, Serialize)]
 pub struct UsageSnapshot {
     pub org_uuid: String,
+    pub browser: String,
+    pub account_email: Option<String>,
     pub fetched_at: chrono::DateTime<chrono::Utc>,
     pub usage: UsageResponse,
-    pub overage: OverageResponse,
+    pub overage: Option<OverageResponse>,
     pub subscription: SubscriptionResponse,
 }

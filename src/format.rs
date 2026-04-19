@@ -19,23 +19,18 @@ pub fn print_pretty(s: &UsageSnapshot) {
         println!("{:<16} {}", "7-day Opus", format_window(w));
     }
 
-    let u = s.overage.used_credits / 100.0;
-    let l = s.overage.monthly_credit_limit as f64 / 100.0;
-    let pct = if l > 0.0 { u / l * 100.0 } else { 0.0 };
-    let status = if s.overage.out_of_credits {
-        "  BLOCKED"
-    } else {
-        ""
-    };
-    let mut line = format!(
-        "${:.2} / ${:.2} ({:.0}%){}",
-        u, l, pct, status
-    );
-    if let Some(until) = &s.overage.disabled_until {
-        let local: DateTime<Local> = (*until).into();
-        line.push_str(&format!(" until {}", local.format("%a %b %-d")));
+    if let Some(ov) = &s.overage {
+        let u = ov.used_credits / 100.0;
+        let l = ov.monthly_credit_limit as f64 / 100.0;
+        let pct = if l > 0.0 { u / l * 100.0 } else { 0.0 };
+        let status = if ov.out_of_credits { "  BLOCKED" } else { "" };
+        let mut line = format!("${:.2} / ${:.2} ({:.0}%){}", u, l, pct, status);
+        if let Some(until) = &ov.disabled_until {
+            let local: DateTime<Local> = (*until).into();
+            line.push_str(&format!(" until {}", local.format("%a %b %-d")));
+        }
+        println!("{:<16} {}", "Extra usage", line);
     }
-    println!("{:<16} {}", "Extra usage", line);
 
     let sub = &s.subscription;
     let pm = sub
@@ -55,9 +50,12 @@ pub fn print_pretty(s: &UsageSnapshot) {
 
     println!();
     let local: DateTime<Local> = s.fetched_at.into();
+    let who = s.account_email.as_deref().unwrap_or("?");
     println!(
-        "fetched {}   org {}",
+        "fetched {}   {} via {}   org {}",
         local.format("%Y-%m-%d %H:%M:%S %Z"),
+        who,
+        s.browser,
         s.org_uuid
     );
 }

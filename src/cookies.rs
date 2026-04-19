@@ -6,49 +6,107 @@ use sha1::Sha1;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use crate::browser::Browser;
+use crate::keychain;
+
 type Aes128CbcDec = cbc::Decryptor<Aes128>;
 
 pub struct ClaudeCookies {
+    pub browser: Browser,
     pub last_active_org: String,
     pub all: HashMap<String, String>,
 }
 
-pub fn find_and_decrypt_claude_cookies(safe_storage_pw: &[u8]) -> Result<ClaudeCookies> {
-    let key = derive_key(safe_storage_pw);
-    let (profile_path, cookies_path) = find_profile_with_claude()?;
+pub fn find_all_claude_sessions() -> Result<Vec<ClaudeCookies>> {
+    let mut sessions: Vec<ClaudeCookies> = Vec::new();
+    let mut tried: Vec<String> = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
 
-    // Copy the DB so we don't fight Chrome for the file lock.
-    let temp_path = std::env::temp_dir()
-        .join(format!("claude-meter-cookies-{}.db", std::process::id()));
+    for &browser in Browser::ALL {
+        let root = match browser.profile_root()? {
+            Some(r) => r,
+            None => continue,
+        };
+        tried.push(browser.display_name().to_string());
+
+        match try_browser(browser, &root) {
+            Ok(Some(cookies)) => sessions.push(cookies),
+            Ok(None) => {}
+            Err(e) => errors.push(format!("{}: {e:#}", browser.display_name())),
+        }
+    }
+
+    if !sessions.is_empty() {
+        return Ok(sessions);
+    }
+    if tried.is_empty() {
+        bail!(
+            "no supported browser found. claude-meter supports Chrome, Arc, Brave, Edge on macOS."
+        );
+    }
+    if errors.is_empty() {
+        bail!(
+            "no {} profile has claude.ai cookies. Log into claude.ai in one of them, then retry.",
+            tried.join("/")
+        );
+    }
+    bail!(
+        "could not find claude.ai cookies in any installed browser ({}). Errors: {}",
+        tried.join(", "),
+        errors.join("; ")
+    )
+}
+
+fn try_browser(browser: Browser, root: &Path) -> Result<Option<ClaudeCookies>> {
+    let mut candidates: Vec<PathBuf> = vec![root.join("Default")];
+    for entry in std::fs::read_dir(root)? {
+        let p = entry?.path();
+        let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        if p.is_dir() && name.starts_with("Profile ") {
+            candidates.push(p);
+        }
+    }
+
+    // Find a profile with claude.ai cookies before we pay the Keychain cost.
+    let mut cookies_path: Option<PathBuf> = None;
+    'outer: for profile in &candidates {
+        for sub in &["Network/Cookies", "Cookies"] {
+            let p = profile.join(sub);
+            if p.exists() && profile_has_claude(&p).unwrap_or(false) {
+                cookies_path = Some(p);
+                break 'outer;
+            }
+        }
+    }
+    let cookies_path = match cookies_path {
+        Some(x) => x,
+        None => return Ok(None),
+    };
+
+    let pw = keychain::safe_storage_password(browser).with_context(|| {
+        format!(
+            "read {} Safe Storage password from Keychain",
+            browser.display_name()
+        )
+    })?;
+    let key = derive_key(&pw);
+
+    let temp_path = std::env::temp_dir().join(format!(
+        "claude-meter-cookies-{}-{}.db",
+        browser.display_name().to_ascii_lowercase(),
+        std::process::id()
+    ));
     std::fs::copy(&cookies_path, &temp_path)
         .with_context(|| format!("copy {}", cookies_path.display()))?;
 
-    let conn = Connection::open_with_flags(
-        &temp_path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )?;
-    let mut stmt = conn.prepare(
-        "SELECT name, encrypted_value FROM cookies WHERE host_key LIKE '%claude.ai%'",
-    )?;
-    let rows = stmt.query_map([], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
-    })?;
-
-    let mut decrypted: HashMap<String, String> = HashMap::new();
-    for row in rows {
-        let (name, enc) = row?;
-        if let Some(value) = decrypt_cookie(&key, &enc) {
-            decrypted.insert(name, value);
-        }
-    }
-    drop(stmt);
-    drop(conn);
+    let decrypted = decrypt_all(&temp_path, &key);
     let _ = std::fs::remove_file(&temp_path);
+    let decrypted = decrypted?;
 
     if !decrypted.contains_key("sessionKey") {
         bail!(
-            "no sessionKey cookie found. Log into claude.ai in Chrome ({}), then retry.",
-            profile_path.display()
+            "found claude.ai cookies in {} but no sessionKey, log into claude.ai again",
+            browser.display_name()
         );
     }
     let last_active_org = decrypted
@@ -56,10 +114,29 @@ pub fn find_and_decrypt_claude_cookies(safe_storage_pw: &[u8]) -> Result<ClaudeC
         .ok_or_else(|| anyhow!("no lastActiveOrg cookie found"))?
         .clone();
 
-    Ok(ClaudeCookies {
+    Ok(Some(ClaudeCookies {
+        browser,
         last_active_org,
         all: decrypted,
-    })
+    }))
+}
+
+fn decrypt_all(db_path: &Path, key: &[u8; 16]) -> Result<HashMap<String, String>> {
+    let conn = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let mut stmt = conn.prepare(
+        "SELECT name, encrypted_value FROM cookies WHERE host_key LIKE '%claude.ai%'",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+    })?;
+    let mut decrypted: HashMap<String, String> = HashMap::new();
+    for row in rows {
+        let (name, enc) = row?;
+        if let Some(value) = decrypt_cookie(key, &enc) {
+            decrypted.insert(name, value);
+        }
+    }
+    Ok(decrypted)
 }
 
 fn derive_key(password: &[u8]) -> [u8; 16] {
@@ -102,38 +179,6 @@ fn decrypt_cookie(key: &[u8; 16], enc: &[u8]) -> Option<String> {
 
 fn is_printable(b: u8) -> bool {
     (32..127).contains(&b)
-}
-
-fn find_profile_with_claude() -> Result<(PathBuf, PathBuf)> {
-    let home = dirs::home_dir().ok_or_else(|| anyhow!("no home directory"))?;
-    let chrome_root = home.join("Library/Application Support/Google/Chrome");
-    if !chrome_root.exists() {
-        bail!(
-            "Chrome not found at {}. claude-meter v0.1 requires Google Chrome on macOS.",
-            chrome_root.display()
-        );
-    }
-
-    let mut candidates: Vec<PathBuf> = vec![chrome_root.join("Default")];
-    for entry in std::fs::read_dir(&chrome_root)? {
-        let p = entry?.path();
-        let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
-        if p.is_dir() && name.starts_with("Profile ") {
-            candidates.push(p);
-        }
-    }
-
-    for profile in &candidates {
-        for sub in &["Network/Cookies", "Cookies"] {
-            let cookies = profile.join(sub);
-            if cookies.exists() && profile_has_claude(&cookies).unwrap_or(false) {
-                return Ok((profile.clone(), cookies));
-            }
-        }
-    }
-    bail!(
-        "no Chrome profile has claude.ai cookies. Log into claude.ai in Chrome, then retry."
-    )
 }
 
 fn profile_has_claude(cookies_db: &Path) -> Result<bool> {

@@ -1,11 +1,6 @@
 use anyhow::{Context, Result};
+use claude_meter::{api, cookies, dedupe_by_account, format};
 use clap::Parser;
-
-mod api;
-mod cookies;
-mod format;
-mod keychain;
-mod models;
 
 #[derive(Parser)]
 #[command(name = "claude-meter", version, about = "Live Claude plan usage and extra-usage balance")]
@@ -19,20 +14,33 @@ struct Cli {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    let safe_storage_pw = keychain::chrome_safe_storage_password()
-        .context("could not read Chrome Safe Storage password from Keychain. Is Chrome installed?")?;
+    let sessions = cookies::find_all_claude_sessions()
+        .context("could not find a browser profile logged into claude.ai")?;
 
-    let cookies = cookies::find_and_decrypt_claude_cookies(&safe_storage_pw)
-        .context("could not read claude.ai cookies from Chrome")?;
-
-    let snapshot = api::fetch_usage_snapshot(&cookies)
-        .await
-        .context("could not fetch usage from claude.ai")?;
+    let mut snapshots = Vec::with_capacity(sessions.len());
+    for cookies in &sessions {
+        match api::fetch_usage_snapshot(cookies).await {
+            Ok(s) => snapshots.push(s),
+            Err(e) => eprintln!(
+                "warn: {} fetch failed: {e:#}",
+                cookies.browser.display_name()
+            ),
+        }
+    }
+    if snapshots.is_empty() {
+        anyhow::bail!("every browser session failed to fetch usage");
+    }
+    let snapshots = dedupe_by_account(snapshots);
 
     if cli.json {
-        println!("{}", serde_json::to_string_pretty(&snapshot)?);
+        println!("{}", serde_json::to_string_pretty(&snapshots)?);
     } else {
-        format::print_pretty(&snapshot);
+        for (i, s) in snapshots.iter().enumerate() {
+            if i > 0 {
+                println!();
+            }
+            format::print_pretty(s);
+        }
     }
     Ok(())
 }

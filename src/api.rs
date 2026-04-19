@@ -5,27 +5,54 @@ use rquest_util::Emulation;
 use crate::cookies::ClaudeCookies;
 use crate::models::{OverageResponse, SubscriptionResponse, UsageResponse, UsageSnapshot};
 
-const BASE: &str = "https://claude.ai/api/organizations";
+const BASE: &str = "https://claude.ai/api";
 
 pub async fn fetch_usage_snapshot(cookies: &ClaudeCookies) -> Result<UsageSnapshot> {
     let client = build_client()?;
     let cookie_header = build_cookie_header(cookies)?;
     let org = &cookies.last_active_org;
 
-    let usage: UsageResponse =
-        get_json(&client, &cookie_header, &format!("{BASE}/{org}/usage")).await?;
-    let overage: OverageResponse =
-        get_json(&client, &cookie_header, &format!("{BASE}/{org}/overage_spend_limit")).await?;
-    let subscription: SubscriptionResponse =
-        get_json(&client, &cookie_header, &format!("{BASE}/{org}/subscription_details")).await?;
+    let usage: UsageResponse = get_json(
+        &client,
+        &cookie_header,
+        &format!("{BASE}/organizations/{org}/usage"),
+    )
+    .await?;
+    let overage: Option<OverageResponse> = get_json(
+        &client,
+        &cookie_header,
+        &format!("{BASE}/organizations/{org}/overage_spend_limit"),
+    )
+    .await?;
+    let subscription: SubscriptionResponse = get_json(
+        &client,
+        &cookie_header,
+        &format!("{BASE}/organizations/{org}/subscription_details"),
+    )
+    .await?;
+
+    let account_email = fetch_account_email(&client, &cookie_header).await;
 
     Ok(UsageSnapshot {
         org_uuid: org.clone(),
+        browser: cookies.browser.display_name().to_string(),
+        account_email,
         fetched_at: chrono::Utc::now(),
         usage,
         overage,
         subscription,
     })
+}
+
+async fn fetch_account_email(client: &Client, cookie_header: &str) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct Account {
+        email_address: Option<String>,
+    }
+    get_json::<Account>(client, cookie_header, "https://claude.ai/api/account")
+        .await
+        .ok()
+        .and_then(|a| a.email_address)
 }
 
 fn build_client() -> Result<Client> {
