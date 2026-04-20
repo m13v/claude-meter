@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <!-- Rounded-square backdrop, Claude signature warm orange -->
+  <rect x="0" y="0" width="1024" height="1024" rx="230" ry="230" fill="#CC785C"/>
+  <!-- Subtle inner highlight for depth -->
+  <rect x="32" y="32" width="960" height="480" rx="200" ry="200" fill="#D6876C" opacity="0.35"/>
+
+  <!-- Gauge ring: used portion (filled) + remaining portion (faded).
+       cx=512 cy=512 r=300, stroke width 96.
+       Used arc: start angle -90deg, sweep ~240deg (i.e. 2/3 of circle). -->
+  <g transform="translate(512 512)">
+    <!-- Background track (full ring) -->
+    <circle cx="0" cy="0" r="300" fill="none" stroke="#FFFFFF" stroke-opacity="0.22" stroke-width="96"/>
+    <!-- Used portion: 2/3 of the ring, starting at top -->
+    <!-- Path: arc from (0,-300) going clockwise 240deg -->
+    <path d="M 0 -300
+             A 300 300 0 1 1 -259.81 150"
+          fill="none" stroke="#FFFFFF" stroke-width="96" stroke-linecap="round"/>
+  </g>
+</svg>

@@ -73,13 +73,18 @@ fn main() -> Result<()> {
     }
 
     let (menu, ids) = build_initial_menu();
-    let mut tray_icon = Some(
-        TrayIconBuilder::new()
-            .with_title("Claude: …")
-            .with_tooltip("claude-meter")
-            .with_menu(Box::new(menu))
-            .build()?,
-    );
+    let mut builder = TrayIconBuilder::new()
+        .with_title("Claude: …")
+        .with_tooltip("claude-meter")
+        .with_menu(Box::new(menu));
+    if let Some(icon) = load_menubar_icon() {
+        builder = builder.with_icon(icon);
+        #[cfg(target_os = "macos")]
+        {
+            builder = builder.with_icon_as_template(true);
+        }
+    }
+    let mut tray_icon = Some(builder.build()?);
 
     let menu_channel = MenuEvent::receiver();
     let _tray_channel = TrayIconEvent::receiver();
@@ -469,6 +474,32 @@ fn classify_browser_exe(path: &str) -> Option<String> {
     if p.contains("/chromium.app/") { return Some("Chromium".to_string()); }
     if p.contains("/opera.app/") { return Some("Opera".to_string()); }
     None
+}
+
+/// The menu-bar template PNG is baked into the binary at compile time. macOS
+/// treats template images as masks and auto-inverts them for light/dark menu
+/// bars, which is why the file has black pixels on a transparent background.
+fn load_menubar_icon() -> Option<tray_icon::Icon> {
+    const BYTES: &[u8] = include_bytes!("../../assets/menubar-template@2x.png");
+    let decoder = png::Decoder::new(BYTES);
+    let mut reader = decoder.read_info().ok()?;
+    let mut buf = vec![0u8; reader.output_buffer_size()];
+    let info = reader.next_frame(&mut buf).ok()?;
+    // Normalize to RGBA8 by converting the decoded slice. The SVG → PNG
+    // pipeline always gives us RGBA8 here, but handle the common variants
+    // for defensiveness.
+    let rgba: Vec<u8> = match info.color_type {
+        png::ColorType::Rgba => buf[..info.buffer_size()].to_vec(),
+        png::ColorType::Rgb => {
+            let mut out = Vec::with_capacity(info.width as usize * info.height as usize * 4);
+            for px in buf[..info.buffer_size()].chunks_exact(3) {
+                out.extend_from_slice(&[px[0], px[1], px[2], 0xFF]);
+            }
+            out
+        }
+        _ => return None,
+    };
+    tray_icon::Icon::from_rgba(rgba, info.width, info.height).ok()
 }
 
 fn detect_browser_from_headers(headers: &[tiny_http::Header]) -> Option<String> {

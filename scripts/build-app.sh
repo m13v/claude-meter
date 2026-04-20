@@ -13,7 +13,8 @@ version="0.1.0"
 root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$root"
 
-echo "building release binaries…"
+echo "building icons + release binaries..." >&2
+bash "$root/scripts/build-icons.sh" >&2
 cargo build --release --bin claude-meter --bin claude-meter-menubar >&2
 
 app_path="$out_dir/$app_name.app"
@@ -24,6 +25,7 @@ mkdir -p "$app_path/Contents/Resources"
 cp "target/release/claude-meter-menubar" "$app_path/Contents/MacOS/$app_name"
 # Also ship the CLI next to it for users who want both.
 cp "target/release/claude-meter" "$app_path/Contents/MacOS/claude-meter"
+cp "$root/assets/AppIcon.icns" "$app_path/Contents/Resources/AppIcon.icns"
 
 cat > "$app_path/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -42,6 +44,8 @@ cat > "$app_path/Contents/Info.plist" <<PLIST
     <string>$version</string>
     <key>CFBundleExecutable</key>
     <string>$app_name</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>LSMinimumSystemVersion</key>

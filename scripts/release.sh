@@ -26,6 +26,7 @@ ZIP_PATH="$OUT_DIR/$APP_NAME-$VERSION.zip"
 ENTITLEMENTS="scripts/entitlements.plist"
 
 echo "[1/7] building release binaries..."
+bash scripts/build-icons.sh
 cargo build --release --bin claude-meter --bin claude-meter-menubar
 
 echo "[2/7] assembling $APP_BUNDLE..."
@@ -34,6 +35,7 @@ mkdir -p "$APP_BUNDLE/Contents/MacOS"
 mkdir -p "$APP_BUNDLE/Contents/Resources"
 cp "target/release/claude-meter-menubar" "$APP_BUNDLE/Contents/MacOS/$APP_NAME"
 cp "target/release/claude-meter" "$APP_BUNDLE/Contents/MacOS/claude-meter"
+cp "assets/AppIcon.icns" "$APP_BUNDLE/Contents/Resources/AppIcon.icns"
 
 cat > "$APP_BUNDLE/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -46,6 +48,7 @@ cat > "$APP_BUNDLE/Contents/Info.plist" <<PLIST
     <key>CFBundleVersion</key><string>$VERSION</string>
     <key>CFBundleShortVersionString</key><string>$VERSION</string>
     <key>CFBundleExecutable</key><string>$APP_NAME</string>
+    <key>CFBundleIconFile</key><string>AppIcon</string>
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>LSMinimumSystemVersion</key><string>11.0</string>
     <key>LSUIElement</key><true/>

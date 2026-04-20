@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Menu-bar template icon: monochrome black + alpha. macOS themes it for light/dark. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32">
+  <g transform="translate(16 16)">
+    <!-- Background track (thin full ring, faded) -->
+    <circle cx="0" cy="0" r="10" fill="none" stroke="#000" stroke-opacity="0.35" stroke-width="4"/>
+    <!-- Used portion: 2/3 of the ring -->
+    <path d="M 0 -10
+             A 10 10 0 1 1 -8.66 5"
+          fill="none" stroke="#000" stroke-width="4" stroke-linecap="round"/>
+  </g>
+</svg>
