@@ -1,6 +1,6 @@
 [package]
 name = "claude-meter"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "MIT"
 description = "Live Claude plan usage and extra-usage balance from the terminal"
@@ -38,10 +38,28 @@ dirs = "5"
 chrono = { version = "0.4", features = ["serde"] }
 tray-icon = "0.19"
 tao = "0.30"
+tiny_http = "0.12"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.5"
-objc2-app-kit = { version = "0.2", features = ["NSApplication", "NSResponder"] }
+objc2-app-kit = { version = "0.2", features = [
+    "NSApplication",
+    "NSResponder",
+    "NSWindow",
+    "NSView",
+    "NSControl",
+    "NSButton",
+    "NSStatusBar",
+    "NSStatusBarButton",
+    "NSStatusItem",
+    "NSFont",
+    "NSColor",
+    "NSAttributedString",
+    "NSCell",
+    "NSImage",
+    "NSParagraphStyle",
+    "NSText",
+] }
 objc2-foundation = "0.2"
 
 [profile.release]

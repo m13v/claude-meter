@@ -2,3 +2,4 @@
 /dist
 Cargo.lock.bak
 .DS_Store
+.mcp.json

@@ -1,0 +1,19 @@
+{
+  "manifest_version": 3,
+  "name": "ClaudeMeter",
+  "version": "0.1.1",
+  "description": "Live Claude plan usage (5h + 7d) from the browser toolbar.",
+  "permissions": ["storage", "alarms"],
+  "host_permissions": [
+    "https://claude.ai/*",
+    "http://127.0.0.1:63762/*"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_title": "ClaudeMeter",
+    "default_popup": "popup.html"
+  }
+}

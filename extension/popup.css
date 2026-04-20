@@ -1,0 +1,90 @@
+body {
+  font: 13px -apple-system, system-ui, sans-serif;
+  margin: 0;
+  padding: 10px 12px;
+  width: 280px;
+  color: #1c1c1e;
+  background: #fff;
+}
+header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin: 0 0 8px;
+}
+h1 {
+  font-size: 13px;
+  font-weight: 600;
+  margin: 0;
+  color: #555;
+  letter-spacing: 0.3px;
+}
+#refresh {
+  border: none;
+  background: transparent;
+  color: #555;
+  font-size: 14px;
+  cursor: pointer;
+  padding: 2px 6px;
+  border-radius: 4px;
+}
+#refresh:hover { background: #eee; }
+#status { color: #b00020; font-size: 12px; margin-bottom: 6px; }
+#status:empty { display: none; }
+.account {
+  border-top: 1px solid #eee;
+  padding: 8px 0;
+}
+.account:first-child { border-top: none; }
+.email {
+  font-weight: 600;
+  font-size: 12px;
+  color: #1c1c1e;
+  margin-bottom: 6px;
+  word-break: break-all;
+}
+.row {
+  display: grid;
+  grid-template-columns: 72px 1fr 42px;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  margin: 3px 0;
+}
+.label { color: #666; }
+.bar {
+  height: 6px;
+  background: #ececec;
+  border-radius: 3px;
+  overflow: hidden;
+  position: relative;
+}
+.bar > span {
+  display: block;
+  height: 100%;
+  background: #2c6e2f;
+  transition: width 200ms;
+}
+.bar.warn > span { background: #b26a00; }
+.bar.hot > span { background: #b00020; }
+.pct {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  color: #1c1c1e;
+}
+footer {
+  margin-top: 8px;
+  color: #8a8a8e;
+  font-size: 11px;
+  text-align: right;
+}
+@media (prefers-color-scheme: dark) {
+  body { background: #1c1c1e; color: #f0f0f0; }
+  h1, #refresh { color: #c7c7cc; }
+  #refresh:hover { background: #333; }
+  .account { border-top-color: #2c2c2e; }
+  .email { color: #fff; }
+  .label { color: #aaa; }
+  .bar { background: #2c2c2e; }
+  footer { color: #aaa; }
+}

@@ -6,25 +6,32 @@ pub fn print_pretty(s: &UsageSnapshot) {
     println!("claude-meter");
     println!("============");
 
-    if let Some(w) = &s.usage.five_hour {
-        println!("{:<16} {}", "5-hour", format_window(w));
-    }
-    if let Some(w) = &s.usage.seven_day {
-        println!("{:<16} {}", "7-day all", format_window(w));
-    }
-    if let Some(w) = &s.usage.seven_day_sonnet {
-        println!("{:<16} {}", "7-day Sonnet", format_window(w));
-    }
-    if let Some(w) = &s.usage.seven_day_opus {
-        println!("{:<16} {}", "7-day Opus", format_window(w));
+    if let Some(u) = &s.usage {
+        if let Some(w) = &u.five_hour {
+            println!("{:<16} {}", "5-hour", format_window(w));
+        }
+        if let Some(w) = &u.seven_day {
+            println!("{:<16} {}", "7-day all", format_window(w));
+        }
+        if let Some(w) = &u.seven_day_sonnet {
+            println!("{:<16} {}", "7-day Sonnet", format_window(w));
+        }
+        if let Some(w) = &u.seven_day_opus {
+            println!("{:<16} {}", "7-day Opus", format_window(w));
+        }
     }
 
     if let Some(ov) = &s.overage {
-        let u = ov.used_credits / 100.0;
-        let l = ov.monthly_credit_limit as f64 / 100.0;
-        let pct = if l > 0.0 { u / l * 100.0 } else { 0.0 };
+        let u = ov.used_credits.unwrap_or(0.0) / 100.0;
         let status = if ov.out_of_credits { "  BLOCKED" } else { "" };
-        let mut line = format!("${:.2} / ${:.2} ({:.0}%){}", u, l, pct, status);
+        let mut line = match ov.monthly_credit_limit {
+            Some(l) => {
+                let l = l as f64 / 100.0;
+                let pct = if l > 0.0 { u / l * 100.0 } else { 0.0 };
+                format!("${:.2} / ${:.2} ({:.0}%){}", u, l, pct, status)
+            }
+            None => format!("${:.2} used (no cap){}", u, status),
+        };
         if let Some(until) = &ov.disabled_until {
             let local: DateTime<Local> = (*until).into();
             line.push_str(&format!(" until {}", local.format("%a %b %-d")));
@@ -32,20 +39,25 @@ pub fn print_pretty(s: &UsageSnapshot) {
         println!("{:<16} {}", "Extra usage", line);
     }
 
-    let sub = &s.subscription;
-    let pm = sub
-        .payment_method
-        .as_ref()
-        .map(|p| {
-            format!(
-                "{} \u{2022}\u{2022}{}",
-                p.brand.as_deref().unwrap_or("card"),
-                p.last4.as_deref().unwrap_or("????")
-            )
-        })
-        .unwrap_or_else(|| "-".to_string());
-    if let Some(d) = &sub.next_charge_date {
-        println!("{:<16} {}   {}", "Next charge", d, pm);
+    if let Some(sub) = &s.subscription {
+        let pm = sub
+            .payment_method
+            .as_ref()
+            .map(|p| {
+                format!(
+                    "{} \u{2022}\u{2022}{}",
+                    p.brand.as_deref().unwrap_or("card"),
+                    p.last4.as_deref().unwrap_or("????")
+                )
+            })
+            .unwrap_or_else(|| "-".to_string());
+        if let Some(d) = &sub.next_charge_date {
+            println!("{:<16} {}   {}", "Next charge", d, pm);
+        }
+    }
+
+    for err in &s.errors {
+        println!("{:<16} {}", "error", err);
     }
 
     println!();

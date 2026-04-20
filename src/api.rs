@@ -11,25 +11,53 @@ pub async fn fetch_usage_snapshot(cookies: &ClaudeCookies) -> Result<UsageSnapsh
     let client = build_client()?;
     let cookie_header = build_cookie_header(cookies)?;
     let org = &cookies.last_active_org;
+    let mut errors: Vec<String> = Vec::new();
 
-    let usage: UsageResponse = get_json(
+    let usage: Option<UsageResponse> = match get_json(
         &client,
         &cookie_header,
         &format!("{BASE}/organizations/{org}/usage"),
     )
-    .await?;
-    let overage: Option<OverageResponse> = get_json(
+    .await
+    {
+        Ok(v) => Some(v),
+        Err(e) => {
+            let msg = format!("usage: {e:#}");
+            eprintln!("warn: {msg}");
+            errors.push(msg);
+            None
+        }
+    };
+    let overage: Option<OverageResponse> = match get_json(
         &client,
         &cookie_header,
         &format!("{BASE}/organizations/{org}/overage_spend_limit"),
     )
-    .await?;
-    let subscription: SubscriptionResponse = get_json(
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            let msg = format!("overage: {e:#}");
+            eprintln!("warn: {msg}");
+            errors.push(msg);
+            None
+        }
+    };
+    let subscription: Option<SubscriptionResponse> = match get_json(
         &client,
         &cookie_header,
         &format!("{BASE}/organizations/{org}/subscription_details"),
     )
-    .await?;
+    .await
+    {
+        Ok(v) => Some(v),
+        Err(e) => {
+            let msg = format!("subscription: {e:#}");
+            eprintln!("warn: {msg}");
+            errors.push(msg);
+            None
+        }
+    };
 
     let account_email = fetch_account_email(&client, &cookie_header).await;
 
@@ -41,6 +69,8 @@ pub async fn fetch_usage_snapshot(cookies: &ClaudeCookies) -> Result<UsageSnapsh
         usage,
         overage,
         subscription,
+        errors,
+        stale: false,
     })
 }
 

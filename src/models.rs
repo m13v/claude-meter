@@ -1,12 +1,12 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Window {
     pub utilization: f64,
     pub resets_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExtraUsage {
     pub is_enabled: bool,
     pub monthly_limit: Option<i64>,
@@ -15,7 +15,7 @@ pub struct ExtraUsage {
     pub currency: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UsageResponse {
     pub five_hour: Option<Window>,
     pub seven_day: Option<Window>,
@@ -27,18 +27,19 @@ pub struct UsageResponse {
     pub extra_usage: Option<ExtraUsage>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OverageResponse {
     pub is_enabled: bool,
-    pub monthly_credit_limit: i64,
-    pub currency: String,
-    pub used_credits: f64,
+    pub monthly_credit_limit: Option<i64>,
+    pub currency: Option<String>,
+    pub used_credits: Option<f64>,
     pub disabled_reason: Option<String>,
     pub disabled_until: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default)]
     pub out_of_credits: bool,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PaymentMethod {
     pub brand: Option<String>,
     pub country: Option<String>,
@@ -47,7 +48,7 @@ pub struct PaymentMethod {
     pub kind: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubscriptionResponse {
     pub status: String,
     pub next_charge_date: Option<String>,
@@ -56,13 +57,17 @@ pub struct SubscriptionResponse {
     pub currency: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UsageSnapshot {
     pub org_uuid: String,
     pub browser: String,
     pub account_email: Option<String>,
     pub fetched_at: chrono::DateTime<chrono::Utc>,
-    pub usage: UsageResponse,
+    pub usage: Option<UsageResponse>,
     pub overage: Option<OverageResponse>,
-    pub subscription: SubscriptionResponse,
+    pub subscription: Option<SubscriptionResponse>,
+    #[serde(default)]
+    pub errors: Vec<String>,
+    #[serde(default)]
+    pub stale: bool,
 }
