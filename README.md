@@ -1,74 +1,85 @@
 # claude-meter
 
-Live Claude plan usage and extra-usage balance, from the terminal.
+Live Claude plan usage (5-hour + 7-day windows) in your macOS menu bar.
 
-Anthropic's Pro, Max, and Max 20x plans run on a rolling 5-hour window plus a weekly quota, and once you blow through either, you're on metered "extra usage" billing. Today there's no official CLI, no documented API, no menu-bar indicator - the only place to see where you stand is `claude.ai/settings/usage`.
+![menu bar](https://img.shields.io/badge/macOS-menu%20bar-000?logo=apple) ![license](https://img.shields.io/badge/license-MIT-blue) [![release](https://img.shields.io/github/v/release/m13v/claude-meter)](https://github.com/m13v/claude-meter/releases/latest)
 
-`claude-meter` reads the same numbers that page reads, prints them in your terminal in under a second, and runs headless (no browser window).
-
-## What it shows
-
-```
-claude-meter
-============
-5-hour             0.0% used
-7-day all         40.0% used    -> resets Fri Apr 24 10:00 (in 4d 6h)
-7-day Sonnet       0.0% used
-Extra usage      $202.14 / $200.00 (101%)  BLOCKED until Fri May 1
-Next charge      2026-04-30   mastercard ..0936
-
-fetched 2026-04-19 10:55:02 PDT   org d03d2d69-...
-```
-
-`--json` returns the full snapshot as structured JSON for scripting.
+Anthropic's Pro / Max plans run on a rolling 5-hour window plus a weekly quota, with metered "extra usage" billing on top. The only place to see where you stand is `claude.ai/settings/usage`. `claude-meter` shows those numbers live in your menu bar and as a CLI.
 
 ## Install
 
-Requires Rust 1.85+ and, for now, macOS with Google Chrome.
+Pick one of the two routes below.
 
-```bash
-git clone https://github.com/m13v/claude-meter
-cd claude-meter
-cargo install --path .
+### Route A: Menu-bar app + browser extension (recommended, no keychain prompt)
+
+```
+brew install --cask m13v/tap/claude-meter
 ```
 
-Then:
+Then load the extension in each browser you use with Claude (Chrome, Arc, Brave, Edge):
 
-```bash
-claude-meter
-claude-meter --json
+1. Clone this repo: `git clone https://github.com/m13v/claude-meter`
+2. Open `chrome://extensions` (or `arc://extensions`, etc.)
+3. Enable **Developer mode** (top right)
+4. **Load unpacked** → select the `extension/` folder
+5. Pin the ClaudeMeter icon if you want the popup
+
+The extension fetches your usage using your existing `claude.ai` cookies and pushes it to the menu-bar app over `localhost:63762`. No passwords, no keychain prompts, no new logins.
+
+### Route B: Menu-bar app only (keychain password)
+
 ```
+brew install --cask m13v/tap/claude-meter
+```
+
+On first launch, macOS asks:
+
+> **ClaudeMeter wants to use the confidential information stored in "Chrome Safe Storage" in your keychain.**
+
+Click **Always Allow**. The app then reads your Chrome cookie database directly and decrypts the session cookie. Works without the extension, but the prompt is broad because "Chrome Safe Storage" is Chrome's master key for cookies, saved passwords, and credit cards. Click Deny → the app has no data source and shows `!`.
+
+## Privacy
+
+- No telemetry, no analytics, no network egress beyond `claude.ai` itself.
+- All cookies, tokens, and API responses stay on your machine.
+- The menu-bar app's bridge (`127.0.0.1:63762`) is localhost-only.
+- Open source (MIT), audit it.
+
+## CLI
+
+The brew cask also installs a `claude-meter` CLI next to the app:
+
+```
+/Applications/ClaudeMeter.app/Contents/MacOS/claude-meter
+/Applications/ClaudeMeter.app/Contents/MacOS/claude-meter --json
+```
+
+Prints the same data as the menu bar, one-shot, machine-readable with `--json`.
 
 ## How it works
 
-1. Reads the Chrome Safe Storage AES key from the macOS Keychain.
-2. Scans your Chrome profiles, finds the one logged into `claude.ai`, and decrypts the session cookies from that profile's SQLite cookie store.
-3. Calls three undocumented endpoints, impersonating Chrome's TLS fingerprint so Cloudflare lets it through:
-   - `/api/organizations/{uuid}/usage` - 5-hour and 7-day utilization per model family
-   - `/api/organizations/{uuid}/overage_spend_limit` - extra-usage credits used, monthly cap, block state
-   - `/api/organizations/{uuid}/subscription_details` - plan status and next charge
+1. **Via extension** (Route A): the extension runs every 60 seconds, fetches `/api/organizations/{uuid}/usage` with your logged-in cookies, and POSTs the snapshot to the menu-bar app over localhost.
+2. **Via keychain** (Route B): the menu-bar app shells out to `security find-generic-password` to get Chrome's Safe Storage AES key, locates the profile logged into `claude.ai`, decrypts its cookies, and calls the same endpoints itself (Chromium-family browsers only).
 
-Your cookies, tokens, and responses never leave your machine.
+The menu-bar app identifies which browser sent each POST by looking up the peer TCP socket's owning process, so Chrome and Arc get labeled correctly without any user configuration.
 
-## Requirements
+## Limitations
 
-- macOS
-- Google Chrome with an active `claude.ai` session (you must have logged in)
-- Rust 1.85+ to build from source
+- macOS only. Linux/Windows not planned.
+- Safari uses `.binarycookies` under Full Disk Access; not supported yet.
+- Endpoints are undocumented; Anthropic can change them at any time.
+- Session cookies expire; log back into `claude.ai` in your browser and the extension picks it up.
 
-## Limitations (v0.1)
+## Build from source
 
-- macOS + Chrome only. Arc/Brave/Edge use the same Chromium cookie format and should work with a small path tweak; Firefox and Safari do not and are not planned for v0.1.
-- Plan tier name (Pro / Max / Max 20x) is not returned by these endpoints. You get the utilization and the dollar balance, not the tier label.
-- Relies on undocumented `claude.ai` internal endpoints. Anthropic can change or remove them at any time. There is no stable public API for subscription usage today (see Anthropic support issue [#40395](https://github.com/anthropics/claude-code/issues/40395), closed "not planned").
-- Session cookies expire; if `claude-meter` starts returning auth errors, log into `claude.ai` in Chrome and retry.
-
-## Why this exists
-
-Since Anthropic introduced the "extra usage" model in April 2026 (third-party apps like Claude Code, Cursor, and Zed now draw from a metered pool that sits on top of your plan), people get blindsided by billing at runtime. The phrase `"third-party apps now draw from your extra usage, not your plan limits"` is one of the most-searched Anthropic error messages on Google. `claude-meter` is the first tool I've found that surfaces that number before the error.
-
-This is the CLI layer. A macOS menu-bar app that polls on a schedule and notifies you when you're about to hit the wall is in progress.
+```
+git clone https://github.com/m13v/claude-meter
+cd claude-meter
+cargo build --release
+# CLI:  ./target/release/claude-meter
+# App:  bash scripts/build-app.sh
+```
 
 ## License
 
-MIT
+MIT. See [LICENSE](LICENSE).
