@@ -4,6 +4,7 @@ pub mod cookies;
 pub mod format;
 pub mod keychain;
 pub mod models;
+pub mod oauth;
 
 use models::UsageSnapshot;
 
