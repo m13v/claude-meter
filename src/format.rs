@@ -37,6 +37,21 @@ pub fn print_pretty(s: &UsageSnapshot) {
             line.push_str(&format!(" until {}", local.format("%a %b %-d")));
         }
         println!("{:<16} {}", "Extra usage", line);
+    } else if let Some(ex) = s.usage.as_ref().and_then(|u| u.extra_usage.as_ref()) {
+        // Fallback: OAuth /api/oauth/usage embeds extra_usage but doesn't expose
+        // the dedicated overage_spend_limit endpoint. Show what we have.
+        if ex.is_enabled {
+            let used = ex.used_credits.unwrap_or(0.0) / 100.0;
+            let line = match ex.monthly_limit {
+                Some(l) => {
+                    let l = l as f64 / 100.0;
+                    let pct = if l > 0.0 { used / l * 100.0 } else { 0.0 };
+                    format!("${:.2} / ${:.2} ({:.0}%)", used, l, pct)
+                }
+                None => format!("${:.2} used (no cap)", used),
+            };
+            println!("{:<16} {}", "Extra usage", line);
+        }
     }
 
     if let Some(sub) = &s.subscription {
