@@ -908,7 +908,15 @@ fn merge_with_persisted(
         }
         by_key.insert(k, old);
     }
-    by_key.into_values().collect()
+    let merged: Vec<UsageSnapshot> = by_key.into_values().collect();
+    // Final pass: collapse rows that point at the same account but have
+    // different `browser` keys, e.g. an old persisted "Arc" row for
+    // mattdiak@... alongside a new "Claude Code, Arc" row from the OAuth
+    // refactor. Sort fresh-first so dedupe_by_account picks fresh as the
+    // winner and back-fills any subscription/overage from the stale duplicate.
+    let mut sorted = merged;
+    sorted.sort_by_key(|s| (s.stale, std::cmp::Reverse(s.fetched_at)));
+    dedupe_by_account(sorted)
 }
 
 fn prefer(a: &UsageSnapshot, b: &UsageSnapshot) -> bool {
