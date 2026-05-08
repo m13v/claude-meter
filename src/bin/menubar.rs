@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use chrono::{DateTime, Local};
-use claude_meter::{api, cookies, dedupe_by_account, models::UsageSnapshot};
+use claude_meter::{api, cookies, dedupe_by_account, models::UsageSnapshot, oauth};
 use serde::{Deserialize, Serialize};
 use tao::event::Event;
 use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
@@ -596,20 +596,48 @@ fn bundle_id_to_name(id: String) -> Option<String> {
 }
 
 async fn fetch_all() -> Result<Vec<UsageSnapshot>, String> {
-    let sessions = cookies::find_all_claude_sessions().map_err(|e| format!("{e:#}"))?;
-    let mut snaps = Vec::with_capacity(sessions.len());
-    for session in &sessions {
-        match api::fetch_usage_snapshot(session).await {
-            Ok(s) => snaps.push(s),
-            Err(e) => eprintln!(
-                "warn: {} fetch failed: {e:#}",
-                session.browser.display_name()
-            ),
+    let mut snaps: Vec<UsageSnapshot> = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
+
+    // Source 1: OAuth keychain (primary). Cleanest path; covers the active
+    // Claude Code CLI account directly, no Cloudflare bypass needed.
+    match oauth::fetch_oauth_snapshot().await {
+        Ok(s) => snaps.push(s),
+        Err(e) => {
+            eprintln!("warn: oauth fetch failed: {e:#}");
+            errors.push(format!("oauth: {e:#}"));
         }
     }
+
+    // Source 2: Browser cookies (fallback / multi-account fill-in).
+    match cookies::find_all_claude_sessions() {
+        Ok(sessions) => {
+            for session in &sessions {
+                match api::fetch_usage_snapshot(session).await {
+                    Ok(s) => snaps.push(s),
+                    Err(e) => eprintln!(
+                        "warn: {} cookie fetch failed: {e:#}",
+                        session.browser.display_name()
+                    ),
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("warn: cookie discovery failed: {e:#}");
+            errors.push(format!("cookies: {e:#}"));
+        }
+    }
+
     if snaps.is_empty() {
-        Err("no browser session returned usage".to_string())
+        let why = if errors.is_empty() {
+            "no source returned usage".to_string()
+        } else {
+            errors.join("; ")
+        };
+        Err(why)
     } else {
+        // dedupe_by_account merges source rows for the same account; OAuth
+        // is pushed first so its numbers win on the account it covers.
         Ok(dedupe_by_account(snaps))
     }
 }
