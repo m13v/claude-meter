@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use chrono::{DateTime, Local};
-use claude_meter::{api, cookies, dedupe_by_account, models::UsageSnapshot, oauth};
+use claude_meter::{dedupe_by_account, models::UsageSnapshot, oauth};
 use serde::{Deserialize, Serialize};
 use tao::event::Event;
 use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
@@ -15,7 +15,23 @@ use tray_icon::menu::{
 };
 use tray_icon::{TrayIcon, TrayIconBuilder, TrayIconEvent};
 
-const POLL_INTERVAL: Duration = Duration::from_secs(60);
+const POLL_INTERVAL: Duration = Duration::from_secs(30);
+
+/// The browser tag set by the OAuth source (`oauth::fetch_oauth_snapshot`).
+/// Used to identify the active Claude Code CLI account vs cookie-sourced
+/// snapshots from other browser logins.
+const OAUTH_BROWSER_TAG: &str = "Claude Code";
+
+/// Drop any snapshot that didn't come from the OAuth (active Claude Code CLI)
+/// source. Browser-cookie snapshots from other accounts (mediar.ai logged into
+/// Chrome, etc.) get filtered out so the menu bar only surfaces the account
+/// the user is actually burning right now.
+fn keep_active_only(snaps: Vec<UsageSnapshot>) -> Vec<UsageSnapshot> {
+    snaps
+        .into_iter()
+        .filter(|s| s.browser.split(", ").any(|b| b == OAUTH_BROWSER_TAG))
+        .collect()
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -119,6 +135,15 @@ fn main() -> Result<()> {
         match event {
             Event::UserEvent(AppEvent::Refreshing) => {}
             Event::UserEvent(AppEvent::Snapshots(Ok(snaps))) => {
+                // Filter to active Claude Code CLI account only. Bridge POSTs
+                // from the browser extension still arrive on this channel and
+                // may carry other-browser cookie data we no longer want to
+                // display.
+                let snaps = keep_active_only(snaps);
+                if snaps.is_empty() {
+                    // Nothing to show; keep the old state instead of clearing.
+                    return;
+                }
                 last_fetched = Some(Local::now());
                 last_error = None;
                 let prev = last_snaps.clone().unwrap_or_default();
@@ -596,49 +621,17 @@ fn bundle_id_to_name(id: String) -> Option<String> {
 }
 
 async fn fetch_all() -> Result<Vec<UsageSnapshot>, String> {
-    let mut snaps: Vec<UsageSnapshot> = Vec::new();
-    let mut errors: Vec<String> = Vec::new();
-
-    // Source 1: OAuth keychain (primary). Cleanest path; covers the active
-    // Claude Code CLI account directly, no Cloudflare bypass needed.
+    // OAuth-only: the menu bar surfaces the active Claude Code CLI account,
+    // not whatever else might be logged into the user's browsers. Cookie-source
+    // multi-account aggregation was removed because users found it confusing
+    // to see another account's quota in the bar (e.g. mediar.ai showing 93%
+    // while the active CLI account was at 32%).
     match oauth::fetch_oauth_snapshot().await {
-        Ok(s) => snaps.push(s),
+        Ok(s) => Ok(vec![s]),
         Err(e) => {
             eprintln!("warn: oauth fetch failed: {e:#}");
-            errors.push(format!("oauth: {e:#}"));
+            Err(format!("oauth: {e:#}"))
         }
-    }
-
-    // Source 2: Browser cookies (fallback / multi-account fill-in).
-    match cookies::find_all_claude_sessions() {
-        Ok(sessions) => {
-            for session in &sessions {
-                match api::fetch_usage_snapshot(session).await {
-                    Ok(s) => snaps.push(s),
-                    Err(e) => eprintln!(
-                        "warn: {} cookie fetch failed: {e:#}",
-                        session.browser.display_name()
-                    ),
-                }
-            }
-        }
-        Err(e) => {
-            eprintln!("warn: cookie discovery failed: {e:#}");
-            errors.push(format!("cookies: {e:#}"));
-        }
-    }
-
-    if snaps.is_empty() {
-        let why = if errors.is_empty() {
-            "no source returned usage".to_string()
-        } else {
-            errors.join("; ")
-        };
-        Err(why)
-    } else {
-        // dedupe_by_account merges source rows for the same account; OAuth
-        // is pushed first so its numbers win on the account it covers.
-        Ok(dedupe_by_account(snaps))
     }
 }
 
@@ -937,6 +930,9 @@ fn load_snapshots() -> Vec<UsageSnapshot> {
     let Some(path) = snapshots_path() else { return Vec::new() };
     let Ok(s) = std::fs::read_to_string(&path) else { return Vec::new() };
     let mut snaps: Vec<UsageSnapshot> = serde_json::from_str(&s).unwrap_or_default();
+    // Drop any persisted entries from the old multi-account era that aren't
+    // tagged with the OAuth source. They'd otherwise resurface as stale rows.
+    snaps = keep_active_only(snaps);
     for s in &mut snaps {
         s.stale = true;
     }
