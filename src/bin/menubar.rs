@@ -23,13 +23,13 @@ const POLL_INTERVAL: Duration = Duration::from_secs(30);
 const OAUTH_BROWSER_TAG: &str = "Claude Code";
 
 /// Drop any snapshot that didn't come from the OAuth (active Claude Code CLI)
-/// source. Browser-cookie snapshots from other accounts (mediar.ai logged into
-/// Chrome, etc.) get filtered out so the menu bar only surfaces the account
-/// the user is actually burning right now.
+/// source. Match the browser tag exactly: "Claude Code" only. Compound tags
+/// like "Arc, Claude Code" are stale rows from the old multi-source dedupe and
+/// belong to other accounts, so they get dropped.
 fn keep_active_only(snaps: Vec<UsageSnapshot>) -> Vec<UsageSnapshot> {
     snaps
         .into_iter()
-        .filter(|s| s.browser.split(", ").any(|b| b == OAUTH_BROWSER_TAG))
+        .filter(|s| s.browser == OAUTH_BROWSER_TAG)
         .collect()
 }
 
@@ -146,8 +146,12 @@ fn main() -> Result<()> {
                 }
                 last_fetched = Some(Local::now());
                 last_error = None;
-                let prev = last_snaps.clone().unwrap_or_default();
-                let merged = merge_with_persisted(snaps, prev);
+                // OAuth is now the only source and returns exactly one snapshot
+                // for the active account. Replace state instead of dedupe-merging
+                // with persisted rows, which would re-tag the browser as
+                // "Claude Code, Arc" and then get dropped by keep_active_only on
+                // the next load.
+                let merged = snaps;
                 save_snapshots(&merged);
                 let numbers_changed = last_snaps
                     .as_ref()
@@ -337,7 +341,7 @@ fn account_set_changed(a: &[UsageSnapshot], b: &[UsageSnapshot]) -> bool {
 fn poll_loop(
     proxy: EventLoopProxy<AppEvent>,
     refresh_rx: mpsc::Receiver<()>,
-    last_bridge: std::sync::Arc<std::sync::Mutex<Option<std::time::Instant>>>,
+    _last_bridge: std::sync::Arc<std::sync::Mutex<Option<std::time::Instant>>>,
 ) {
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -352,19 +356,15 @@ fn poll_loop(
         }
     };
 
+    // Always poll OAuth on every tick. The previous bridge-freshness skip was
+    // built for the multi-source era, where browser-extension POSTs were a
+    // legitimate alternate source. Now that fetch_all is OAuth-only, suppressing
+    // the OAuth call when an extension POST arrives just leaves the menu bar
+    // showing stale numbers from the active CLI account.
     loop {
-        let bridge_fresh = last_bridge
-            .lock()
-            .ok()
-            .and_then(|g| *g)
-            .map(|t| t.elapsed() < BRIDGE_FRESHNESS)
-            .unwrap_or(false);
-
-        if !bridge_fresh {
-            let _ = proxy.send_event(AppEvent::Refreshing);
-            let result = rt.block_on(fetch_all());
-            let _ = proxy.send_event(AppEvent::Snapshots(result));
-        }
+        let _ = proxy.send_event(AppEvent::Refreshing);
+        let result = rt.block_on(fetch_all());
+        let _ = proxy.send_event(AppEvent::Snapshots(result));
 
         let _ = refresh_rx.recv_timeout(POLL_INTERVAL);
         while refresh_rx.try_recv().is_ok() {}
