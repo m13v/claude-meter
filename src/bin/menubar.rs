@@ -17,11 +17,17 @@ use tray_icon::{TrayIcon, TrayIconBuilder, TrayIconEvent};
 
 const POLL_INTERVAL: Duration = Duration::from_secs(60);
 
-/// When Anthropic returns 429 we back off this long before resuming the
-/// normal poll cadence. The actual rate-limit reset isn't exposed in the
-/// response, so we pick a number that's polite enough to clear most
-/// per-minute buckets without making the menu bar look frozen.
-const RATE_LIMIT_BACKOFF: Duration = Duration::from_secs(300);
+/// Backoff schedule after Anthropic returns 429. The first 429 is often a
+/// per-minute bucket transient and clears in 60-90s, so a long wait is
+/// overkill and leaves the menu bar showing the error too long. Repeated
+/// 429s suggest the per-hour or per-day limit, where we want to back off
+/// more aggressively. Index = number of *consecutive* 429s already seen
+/// (saturating; the last entry repeats).
+const RATE_LIMIT_BACKOFF_LADDER: &[Duration] = &[
+    Duration::from_secs(75),
+    Duration::from_secs(180),
+    Duration::from_secs(300),
+];
 
 /// Utilization (%) on the 5-hour rolling window at which the alarm fires.
 const ALARM_THRESHOLD: f64 = 95.0;
@@ -259,11 +265,18 @@ fn main() -> Result<()> {
             }
             Event::UserEvent(AppEvent::Snapshots(Err(e))) => {
                 last_error = Some(e.clone());
-                let (new_menu, new_ids) = build_error_menu(&e);
-                if let Some(tray) = tray_icon.as_ref() {
-                    let _ = tray.set_menu(Some(Box::new(new_menu)));
+                // Only swap to the bare error menu if we have NO last-good
+                // data. With data we keep the regular menu (alarm toggle,
+                // account submenu, etc.) and let apply_title append a "!"
+                // marker so the user still sees usage numbers and can mute
+                // the alarm during a 429 backoff.
+                if last_snaps.is_none() {
+                    let (new_menu, new_ids) = build_error_menu(&e);
+                    if let Some(tray) = tray_icon.as_ref() {
+                        let _ = tray.set_menu(Some(Box::new(new_menu)));
+                    }
+                    current_ids = new_ids;
                 }
-                current_ids = new_ids;
                 dirty = true;
             }
             _ => {}
@@ -374,10 +387,21 @@ fn apply_title(
     fmt: TitleFormat,
     preferred_browser: Option<&str>,
 ) {
-    let segs = if error.is_some() {
+    // Title precedence:
+    //   - have snaps: render them, even if the latest fetch errored. Append
+    //     " !" so the user can tell the data is stale without losing the
+    //     numbers entirely (avoids the bare "Claude: !" that hid usage during
+    //     429 backoff).
+    //   - no snaps + error: bare "Claude: !" (we have nothing else to show).
+    //   - no snaps + no error: "Claude: …" (still loading).
+    let segs = if let Some(s) = snaps {
+        let mut segs = title_segments(fmt, s, preferred_browser);
+        if error.is_some() {
+            segs.push(TitleSeg { text: " !".into(), bg: None });
+        }
+        segs
+    } else if error.is_some() {
         vec![TitleSeg { text: "Claude: !".into(), bg: None }]
-    } else if let Some(s) = snaps {
-        title_segments(fmt, s, preferred_browser)
     } else {
         vec![TitleSeg { text: "Claude: …".into(), bg: None }]
     };
@@ -472,11 +496,12 @@ fn poll_loop(
     // the OAuth call when an extension POST arrives just leaves the menu bar
     // showing stale numbers from the active CLI account.
     //
-    // Rate-limit backoff: when fetch_all returns an error containing "429" we
-    // assume Anthropic is throttling us and wait RATE_LIMIT_BACKOFF before the
-    // next tick instead of the usual POLL_INTERVAL. The next successful fetch
-    // resets the cadence. The user-visible refresh button still works during
-    // the backoff because we read on `refresh_rx` for the wait.
+    // Rate-limit backoff: when fetch_all returns 429 we step through
+    // RATE_LIMIT_BACKOFF_LADDER (consecutive-failure index). The first 429 is
+    // usually a per-minute bucket and clears in ~75s; repeated 429s indicate
+    // a longer-window cap and need a longer wait. A successful fetch resets
+    // the counter. The Refresh menu button bypasses the wait via refresh_rx.
+    let mut consecutive_429s: usize = 0;
     loop {
         let _ = proxy.send_event(AppEvent::Refreshing);
         let result = rt.block_on(fetch_all());
@@ -487,12 +512,17 @@ fn poll_loop(
         let _ = proxy.send_event(AppEvent::Snapshots(result));
 
         let wait = if rate_limited {
+            let idx = consecutive_429s.min(RATE_LIMIT_BACKOFF_LADDER.len() - 1);
+            let dur = RATE_LIMIT_BACKOFF_LADDER[idx];
             eprintln!(
-                "rate-limited by anthropic; backing off for {}s",
-                RATE_LIMIT_BACKOFF.as_secs()
+                "rate-limited by anthropic (consecutive={}); backing off for {}s",
+                consecutive_429s + 1,
+                dur.as_secs()
             );
-            RATE_LIMIT_BACKOFF
+            consecutive_429s = consecutive_429s.saturating_add(1);
+            dur
         } else {
+            consecutive_429s = 0;
             POLL_INTERVAL
         };
         let _ = refresh_rx.recv_timeout(wait);
