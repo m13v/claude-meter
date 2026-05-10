@@ -119,16 +119,13 @@ fn main() -> Result<()> {
     let proxy = event_loop.create_proxy();
     let (refresh_tx, refresh_rx) = mpsc::channel::<()>();
 
-    let last_bridge: Arc<Mutex<Option<std::time::Instant>>> = Arc::new(Mutex::new(None));
-    {
-        let proxy = proxy.clone();
-        let last_bridge = last_bridge.clone();
-        std::thread::spawn(move || bridge_loop(proxy, last_bridge));
-    }
-    {
-        let last_bridge = last_bridge.clone();
-        std::thread::spawn(move || poll_loop(proxy, refresh_rx, last_bridge));
-    }
+    // Bridge listener (port 63762) was the legacy cookie-source path that
+    // accepted POSTs from the browser extension. Now that fetch_all is
+    // OAuth-only and keep_active_only() drops anything tagged with a
+    // browser other than "Claude Code", every bridge POST was discarded
+    // anyway. We also saw the bridge holding duplicate FDs per long-lived
+    // keepalive connection (Chrome + Brave each kept 2 FDs open). Removed.
+    std::thread::spawn(move || poll_loop(proxy, refresh_rx));
 
     let (menu, ids) = build_initial_menu();
     let mut builder = TrayIconBuilder::new()
@@ -481,7 +478,6 @@ fn account_set_changed(a: &[UsageSnapshot], b: &[UsageSnapshot]) -> bool {
 fn poll_loop(
     proxy: EventLoopProxy<AppEvent>,
     refresh_rx: mpsc::Receiver<()>,
-    _last_bridge: std::sync::Arc<std::sync::Mutex<Option<std::time::Instant>>>,
 ) {
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -590,136 +586,6 @@ fn max_five_hour_utilization(
         }
     }
     best
-}
-
-const BRIDGE_PORT: u16 = 63762;
-const BRIDGE_FRESHNESS: Duration = Duration::from_secs(120);
-
-fn bridge_loop(
-    proxy: EventLoopProxy<AppEvent>,
-    last_bridge: std::sync::Arc<std::sync::Mutex<Option<std::time::Instant>>>,
-) {
-    use tiny_http::{Header, Method, Response, Server};
-
-    let server = match Server::http(format!("127.0.0.1:{BRIDGE_PORT}")) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("bridge: could not bind 127.0.0.1:{BRIDGE_PORT}: {e}");
-            return;
-        }
-    };
-
-    let cors_origin: Header = "Access-Control-Allow-Origin: *".parse().unwrap();
-    let cors_methods: Header =
-        "Access-Control-Allow-Methods: POST, OPTIONS".parse().unwrap();
-    let cors_headers: Header =
-        "Access-Control-Allow-Headers: Content-Type".parse().unwrap();
-
-    for mut req in server.incoming_requests() {
-        if req.method() == &Method::Options {
-            let r = Response::empty(204)
-                .with_header(cors_origin.clone())
-                .with_header(cors_methods.clone())
-                .with_header(cors_headers.clone());
-            let _ = req.respond(r);
-            continue;
-        }
-
-        if req.method() != &Method::Post || req.url() != "/snapshots" {
-            let r = Response::from_string("not found")
-                .with_status_code(404)
-                .with_header(cors_origin.clone());
-            let _ = req.respond(r);
-            continue;
-        }
-
-        // Prefer identifying the sending browser by looking up which local
-        // process owns the peer socket; fall back to Sec-Ch-Ua / UA sniffing.
-        let detected_browser = req
-            .remote_addr()
-            .and_then(peer_browser_by_port)
-            .or_else(|| detect_browser_from_headers(req.headers()));
-
-        let mut body = String::new();
-        if let Err(e) = req.as_reader().read_to_string(&mut body) {
-            let r = Response::from_string(format!("read error: {e}"))
-                .with_status_code(400)
-                .with_header(cors_origin.clone());
-            let _ = req.respond(r);
-            continue;
-        }
-
-        match serde_json::from_str::<Vec<UsageSnapshot>>(&body) {
-            Ok(mut snaps) => {
-                if let Some(name) = detected_browser.as_deref() {
-                    for s in &mut snaps {
-                        s.browser = name.to_string();
-                    }
-                }
-                if let Ok(mut g) = last_bridge.lock() {
-                    *g = Some(std::time::Instant::now());
-                }
-                let _ = proxy.send_event(AppEvent::Snapshots(Ok(snaps)));
-                let r = Response::from_string("{\"ok\":true}")
-                    .with_header(cors_origin.clone())
-                    .with_header(
-                        "Content-Type: application/json".parse::<Header>().unwrap(),
-                    );
-                let _ = req.respond(r);
-            }
-            Err(e) => {
-                let r = Response::from_string(format!("parse error: {e}"))
-                    .with_status_code(400)
-                    .with_header(cors_origin.clone());
-                let _ = req.respond(r);
-            }
-        }
-    }
-}
-
-/// Look at who owns the TCP peer port on localhost and map that process's
-/// executable to a browser name. Works regardless of what the extension puts in
-/// its Sec-Ch-Ua, because we're asking the OS "which app holds this socket".
-fn peer_browser_by_port(peer: &std::net::SocketAddr) -> Option<String> {
-    use std::process::Command;
-    let port = peer.port();
-    let me = std::process::id();
-    let out = Command::new("/usr/sbin/lsof")
-        .args(["-nP", &format!("-iTCP:{port}"), "-sTCP:ESTABLISHED"])
-        .output()
-        .ok()?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    // First non-header row whose PID isn't us = the browser process.
-    let peer_pid = text.lines().skip(1).find_map(|line| {
-        let mut cols = line.split_whitespace();
-        let _cmd = cols.next()?;
-        let pid: u32 = cols.next()?.parse().ok()?;
-        if pid == me { None } else { Some(pid) }
-    })?;
-    // `ps -o command=` returns the full command line (one line, unaffected by
-    // spaces in app paths like "Google Chrome.app"). The first token is the
-    // executable path; matching substrings on the whole line is fine.
-    let ps = Command::new("/bin/ps")
-        .args(["-p", &peer_pid.to_string(), "-o", "command="])
-        .output()
-        .ok()?;
-    let cmdline = String::from_utf8_lossy(&ps.stdout).to_string();
-    classify_browser_exe(&cmdline)
-}
-
-fn classify_browser_exe(path: &str) -> Option<String> {
-    let p = path.to_lowercase();
-    if p.contains("/arc.app/") { return Some("Arc".to_string()); }
-    if p.contains("/google chrome.app/") || p.contains("/chrome.app/") {
-        return Some("Chrome".to_string());
-    }
-    if p.contains("/brave browser.app/") || p.contains("/brave-browser") {
-        return Some("Brave".to_string());
-    }
-    if p.contains("/microsoft edge.app/") { return Some("Edge".to_string()); }
-    if p.contains("/chromium.app/") { return Some("Chromium".to_string()); }
-    if p.contains("/opera.app/") { return Some("Opera".to_string()); }
-    None
 }
 
 /// The menu-bar template PNG is baked into the binary at compile time. macOS
