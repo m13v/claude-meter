@@ -197,6 +197,12 @@ fn main() -> Result<()> {
                     return;
                 }
                 last_fetched = Some(Local::now());
+                // Transitioning out of an error state must repaint the title
+                // even if the percentages didn't move; otherwise the stale " !"
+                // marker from the previous 429 stays pinned forever (the
+                // `numbers_changed`-only dirty flag below would never fire when
+                // utilization is flat across the backoff window).
+                let error_cleared = last_error.is_some();
                 last_error = None;
                 // OAuth is now the only source and returns exactly one snapshot
                 // for the active account. Replace state instead of dedupe-merging
@@ -259,7 +265,7 @@ fn main() -> Result<()> {
                         );
                     }
                 }
-                if numbers_changed {
+                if numbers_changed || error_cleared {
                     dirty = true;
                 }
             }
