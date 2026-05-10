@@ -15,13 +15,24 @@ use tray_icon::menu::{
 };
 use tray_icon::{TrayIcon, TrayIconBuilder, TrayIconEvent};
 
-const POLL_INTERVAL: Duration = Duration::from_secs(30);
+const POLL_INTERVAL: Duration = Duration::from_secs(60);
 
 /// When Anthropic returns 429 we back off this long before resuming the
 /// normal poll cadence. The actual rate-limit reset isn't exposed in the
 /// response, so we pick a number that's polite enough to clear most
 /// per-minute buckets without making the menu bar look frozen.
 const RATE_LIMIT_BACKOFF: Duration = Duration::from_secs(300);
+
+/// Utilization (%) on the 5-hour rolling window at which the alarm fires.
+const ALARM_THRESHOLD: f64 = 95.0;
+
+/// System sound played when the alarm fires. Sosumi is the classic Mac alert
+/// tone — sharp enough to read as an alarm without sounding like a Slack ping.
+const ALARM_SOUND_PATH: &str = "/System/Library/Sounds/Sosumi.aiff";
+
+/// How many times to play the sound back-to-back. Three repetitions feel like
+/// an alarm; one feels like a notification ping.
+const ALARM_REPEATS: usize = 3;
 
 /// The browser tag set by the OAuth source (`oauth::fetch_oauth_snapshot`).
 /// Used to identify the active Claude Code CLI account vs cookie-sourced
@@ -53,13 +64,32 @@ impl Default for TitleFormat {
     }
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct Config {
     title_format: TitleFormat,
     /// The browser whose account drives the menu-bar title. Defaults to the
     /// system's default http handler. User can override via the menu.
     #[serde(default)]
     preferred_browser: Option<String>,
+    /// When true (default), play a sound and post a notification when 5-hour
+    /// utilization first crosses ALARM_THRESHOLD in the current window. The
+    /// alarm fires once per window; rolls over with `resets_at`.
+    #[serde(default = "default_alarm_enabled")]
+    alarm_enabled: bool,
+}
+
+fn default_alarm_enabled() -> bool {
+    true
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            title_format: TitleFormat::default(),
+            preferred_browser: None,
+            alarm_enabled: true,
+        }
+    }
 }
 
 enum AppEvent {
@@ -399,6 +429,57 @@ fn poll_loop(
 /// Heuristic: an HTTP 429 from any of the upstream calls.
 fn is_rate_limit_error(err: &str) -> bool {
     err.contains("429") || err.to_lowercase().contains("too many requests")
+}
+
+/// Play `Sosumi` ALARM_REPEATS times on a background thread so we don't block
+/// the event loop. `afplay` exits when the sound finishes; sleeping between
+/// invocations keeps the cadence steady.
+fn play_alarm_sound() {
+    std::thread::spawn(|| {
+        for i in 0..ALARM_REPEATS {
+            let _ = std::process::Command::new("/usr/bin/afplay")
+                .arg(ALARM_SOUND_PATH)
+                .status();
+            if i + 1 < ALARM_REPEATS {
+                std::thread::sleep(Duration::from_millis(120));
+            }
+        }
+    });
+}
+
+/// Best-effort visual notification via `osascript`. The macOS notification
+/// surfaces the alarm even if the user wasn't watching the menu bar.
+fn post_alarm_notification(utilization: f64) {
+    let pct = utilization.round() as i64;
+    let body = format!(
+        "Your 5-hour Claude usage just hit {pct}%. Wrap up or wait for the window to reset."
+    );
+    let script = format!(
+        "display notification \"{body}\" with title \"Claude usage at {pct}%\" subtitle \"5-hour rolling window\""
+    );
+    std::thread::spawn(move || {
+        let _ = std::process::Command::new("/usr/bin/osascript")
+            .arg("-e")
+            .arg(script)
+            .status();
+    });
+}
+
+/// Pull the highest 5-hour utilization across snapshots and the `resets_at`
+/// of that row. The reset timestamp is used as a window identifier — when it
+/// changes, we know we're in a new 5-hour window and re-arm the alarm.
+fn max_five_hour_utilization(
+    snaps: &[UsageSnapshot],
+) -> Option<(f64, Option<chrono::DateTime<chrono::Utc>>)> {
+    let mut best: Option<(f64, Option<chrono::DateTime<chrono::Utc>>)> = None;
+    for s in snaps {
+        let Some(usage) = s.usage.as_ref() else { continue };
+        let Some(window) = usage.five_hour.as_ref() else { continue };
+        if best.as_ref().map(|b| window.utilization > b.0).unwrap_or(true) {
+            best = Some((window.utilization, window.resets_at));
+        }
+    }
+    best
 }
 
 const BRIDGE_PORT: u16 = 63762;
