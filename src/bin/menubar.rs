@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -612,39 +611,6 @@ fn load_menubar_icon() -> Option<tray_icon::Icon> {
         _ => return None,
     };
     tray_icon::Icon::from_rgba(rgba, info.width, info.height).ok()
-}
-
-fn detect_browser_from_headers(headers: &[tiny_http::Header]) -> Option<String> {
-    // Chromium browsers send Sec-Ch-Ua like:
-    //   "Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"
-    //   "Not_A Brand";v="8", "Chromium";v="120", "Arc";v="..."
-    //   "Microsoft Edge";v="120", ...
-    //   "Brave";v="120", ...
-    let sec_ch_ua = headers
-        .iter()
-        .find(|h| h.field.equiv("sec-ch-ua"))
-        .map(|h| h.value.as_str().to_string());
-    if let Some(v) = sec_ch_ua {
-        let v_lc = v.to_lowercase();
-        if v_lc.contains("\"arc\"") { return Some("Arc".to_string()); }
-        if v_lc.contains("brave") { return Some("Brave".to_string()); }
-        if v_lc.contains("microsoft edge") || v_lc.contains("\"edge\"") {
-            return Some("Edge".to_string());
-        }
-        if v_lc.contains("google chrome") { return Some("Chrome".to_string()); }
-        if v_lc.contains("chromium") { return Some("Chromium".to_string()); }
-    }
-    // Fall back to User-Agent (less reliable, but works for Edge/Opera/etc.).
-    let ua = headers
-        .iter()
-        .find(|h| h.field.equiv("user-agent"))
-        .map(|h| h.value.as_str().to_string())
-        .unwrap_or_default();
-    let ua_lc = ua.to_lowercase();
-    if ua_lc.contains("edg/") { return Some("Edge".to_string()); }
-    if ua_lc.contains("opr/") || ua_lc.contains("opera/") { return Some("Opera".to_string()); }
-    if ua_lc.contains("chrome/") { return Some("Chrome".to_string()); }
-    None
 }
 
 /// Ask Launch Services which app handles https and return a short name
