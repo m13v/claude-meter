@@ -147,11 +147,21 @@ fn main() -> Result<()> {
         None
     } else {
         if let Some(tray) = tray_icon.as_ref() {
-            current_ids = render_menu_only(tray, &persisted, last_fetched, config.title_format);
+            current_ids = render_menu_only(
+                tray,
+                &persisted,
+                last_fetched,
+                config.title_format,
+                config.alarm_enabled,
+            );
         }
         Some(persisted)
     };
     let mut last_error: Option<String> = None;
+    // Tracks the `resets_at` of the 5-hour window we already fired the alarm
+    // for. When the next snapshot's window has a different `resets_at`, we
+    // know we've rolled into a new window and re-arm.
+    let mut last_alarm_window: Option<chrono::DateTime<chrono::Utc>> = None;
 
     // Paint title immediately from whatever we loaded so the bar doesn't show "…" forever.
     if let Some(tray) = tray_icon.as_ref() {
@@ -189,6 +199,37 @@ fn main() -> Result<()> {
                 // the next load.
                 let merged = snaps;
                 save_snapshots(&merged);
+
+                // Alarm: fire once per 5-hour window when utilization first
+                // crosses the threshold. The `resets_at` of the window is the
+                // identifier — when it changes, we're in a new window and
+                // re-arm. Manual mute via the toggle short-circuits firing
+                // but doesn't affect arming.
+                if let Some((util, resets_at)) = max_five_hour_utilization(&merged) {
+                    let already_fired_this_window = match (last_alarm_window, resets_at) {
+                        (Some(prev), Some(curr)) => prev == curr,
+                        _ => false,
+                    };
+                    if !already_fired_this_window
+                        && util >= ALARM_THRESHOLD
+                        && config.alarm_enabled
+                    {
+                        eprintln!(
+                            "alarm: 5h utilization {:.1}% >= {:.0}% — firing",
+                            util, ALARM_THRESHOLD
+                        );
+                        play_alarm_sound();
+                        post_alarm_notification(util);
+                        last_alarm_window = resets_at.or(Some(chrono::Utc::now()));
+                    } else if let Some(prev) = last_alarm_window {
+                        // Window rolled over → clear so the next high reading
+                        // can fire.
+                        if resets_at.map(|c| c != prev).unwrap_or(false) {
+                            last_alarm_window = None;
+                        }
+                    }
+                }
+
                 let numbers_changed = last_snaps
                     .as_ref()
                     .map(|old| !snaps_equal(old, &merged))
@@ -203,7 +244,13 @@ fn main() -> Result<()> {
                 // reach the user on their next click via title + re-render.
                 if accounts_changed {
                     if let (Some(tray), Some(s)) = (tray_icon.as_ref(), last_snaps.as_deref()) {
-                        current_ids = render_menu_only(tray, s, last_fetched, config.title_format);
+                        current_ids = render_menu_only(
+                            tray,
+                            s,
+                            last_fetched,
+                            config.title_format,
+                            config.alarm_enabled,
+                        );
                     }
                 }
                 if numbers_changed {
@@ -239,11 +286,36 @@ fn main() -> Result<()> {
                     if let (Some(tray), Some(snaps)) =
                         (tray_icon.as_ref(), last_snaps.as_deref())
                     {
-                        current_ids =
-                            render_menu_only(tray, snaps, last_fetched, config.title_format);
+                        current_ids = render_menu_only(
+                            tray,
+                            snaps,
+                            last_fetched,
+                            config.title_format,
+                            config.alarm_enabled,
+                        );
                     }
                     dirty = true;
                 }
+                continue;
+            }
+            if current_ids.alarm_toggle.as_ref() == Some(&menu_event.id) {
+                config.alarm_enabled = !config.alarm_enabled;
+                save_config(&config);
+                if let (Some(tray), Some(snaps)) =
+                    (tray_icon.as_ref(), last_snaps.as_deref())
+                {
+                    current_ids = render_menu_only(
+                        tray,
+                        snaps,
+                        last_fetched,
+                        config.title_format,
+                        config.alarm_enabled,
+                    );
+                }
+                continue;
+            }
+            if current_ids.alarm_test.as_ref() == Some(&menu_event.id) {
+                play_alarm_sound();
                 continue;
             }
             if let Some(url) = current_ids.open_urls.get(&menu_event.id) {
@@ -260,6 +332,7 @@ fn main() -> Result<()> {
                             snaps,
                             last_fetched,
                             config.title_format,
+                            config.alarm_enabled,
                         );
                     }
                     dirty = true;
@@ -287,8 +360,9 @@ fn render_menu_only(
     snaps: &[UsageSnapshot],
     fetched: Option<DateTime<Local>>,
     fmt: TitleFormat,
+    alarm_enabled: bool,
 ) -> MenuIds {
-    let (menu, ids) = build_menu(snaps, fetched, fmt);
+    let (menu, ids) = build_menu(snaps, fetched, fmt, alarm_enabled);
     let _ = tray.set_menu(Some(Box::new(menu)));
     ids
 }
@@ -749,6 +823,11 @@ async fn fetch_all() -> Result<Vec<UsageSnapshot>, String> {
 struct MenuIds {
     refresh: MenuId,
     quit: MenuId,
+    /// "Alarm sound at 95%" toggle. Absent in `bare` menus (initial / error)
+    /// because they're rebuilt on the next successful poll.
+    alarm_toggle: Option<MenuId>,
+    /// "Test alarm sound" — fires the alarm on demand.
+    alarm_test: Option<MenuId>,
     open_urls: HashMap<MenuId, String>,
     format_items: HashMap<MenuId, TitleFormat>,
     forget_account: HashMap<MenuId, String>,
@@ -759,6 +838,8 @@ impl MenuIds {
         Self {
             refresh,
             quit,
+            alarm_toggle: None,
+            alarm_test: None,
             open_urls: HashMap::new(),
             format_items: HashMap::new(),
             forget_account: HashMap::new(),
@@ -794,6 +875,7 @@ fn build_menu(
     snaps: &[UsageSnapshot],
     fetched: Option<DateTime<Local>>,
     fmt: TitleFormat,
+    alarm_enabled: bool,
 ) -> (Menu, MenuIds) {
     let menu = Menu::new();
     let mut open_urls = HashMap::new();
@@ -901,6 +983,24 @@ fn build_menu(
     if let Some(t) = fetched {
         menu.append(&disabled(&format!("Updated {}", t.format("%H:%M:%S")))).ok();
     }
+
+    // Alarm controls: a single toggle ("Sound on (alerts at 95%)" / "Sound
+    // off") plus a "Test alarm sound" item so the user can verify the sound
+    // works without waiting to actually hit 95%. Default on; persisted in
+    // config.json under `alarm_enabled`.
+    let alarm_toggle = CheckMenuItem::new(
+        format!(
+            "Sound alarm at {}% (5h window)",
+            ALARM_THRESHOLD as i64
+        ),
+        true,
+        alarm_enabled,
+        None,
+    );
+    let alarm_test = MenuItem::new("Test alarm sound", true, None);
+    menu.append(&alarm_toggle).ok();
+    menu.append(&alarm_test).ok();
+
     let refresh = MenuItem::new("Refresh now", true, None);
     let quit = MenuItem::new("Quit", true, None);
     menu.append(&refresh).ok();
@@ -911,6 +1011,8 @@ fn build_menu(
         MenuIds {
             refresh: refresh.id().clone(),
             quit: quit.id().clone(),
+            alarm_toggle: Some(alarm_toggle.id().clone()),
+            alarm_test: Some(alarm_test.id().clone()),
             open_urls,
             format_items,
             forget_account,
