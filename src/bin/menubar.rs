@@ -17,6 +17,12 @@ use tray_icon::{TrayIcon, TrayIconBuilder, TrayIconEvent};
 
 const POLL_INTERVAL: Duration = Duration::from_secs(30);
 
+/// When Anthropic returns 429 we back off this long before resuming the
+/// normal poll cadence. The actual rate-limit reset isn't exposed in the
+/// response, so we pick a number that's polite enough to clear most
+/// per-minute buckets without making the menu bar look frozen.
+const RATE_LIMIT_BACKOFF: Duration = Duration::from_secs(300);
+
 /// The browser tag set by the OAuth source (`oauth::fetch_oauth_snapshot`).
 /// Used to identify the active Claude Code CLI account vs cookie-sourced
 /// snapshots from other browser logins.
@@ -361,14 +367,38 @@ fn poll_loop(
     // legitimate alternate source. Now that fetch_all is OAuth-only, suppressing
     // the OAuth call when an extension POST arrives just leaves the menu bar
     // showing stale numbers from the active CLI account.
+    //
+    // Rate-limit backoff: when fetch_all returns an error containing "429" we
+    // assume Anthropic is throttling us and wait RATE_LIMIT_BACKOFF before the
+    // next tick instead of the usual POLL_INTERVAL. The next successful fetch
+    // resets the cadence. The user-visible refresh button still works during
+    // the backoff because we read on `refresh_rx` for the wait.
     loop {
         let _ = proxy.send_event(AppEvent::Refreshing);
         let result = rt.block_on(fetch_all());
+        let rate_limited = match &result {
+            Err(e) => is_rate_limit_error(e),
+            Ok(_) => false,
+        };
         let _ = proxy.send_event(AppEvent::Snapshots(result));
 
-        let _ = refresh_rx.recv_timeout(POLL_INTERVAL);
+        let wait = if rate_limited {
+            eprintln!(
+                "rate-limited by anthropic; backing off for {}s",
+                RATE_LIMIT_BACKOFF.as_secs()
+            );
+            RATE_LIMIT_BACKOFF
+        } else {
+            POLL_INTERVAL
+        };
+        let _ = refresh_rx.recv_timeout(wait);
         while refresh_rx.try_recv().is_ok() {}
     }
+}
+
+/// Heuristic: an HTTP 429 from any of the upstream calls.
+fn is_rate_limit_error(err: &str) -> bool {
+    err.contains("429") || err.to_lowercase().contains("too many requests")
 }
 
 const BRIDGE_PORT: u16 = 63762;
