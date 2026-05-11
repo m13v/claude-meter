@@ -1,6 +1,8 @@
 use std::collections::HashMap;
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::PathBuf;
-use std::sync::mpsc;
+use std::sync::{mpsc, Mutex};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -13,6 +15,65 @@ use tray_icon::menu::{
     CheckMenuItem, Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem, Submenu,
 };
 use tray_icon::{TrayIcon, TrayIconBuilder, TrayIconEvent};
+
+/// Sentry DSN for the `claude-meter` project in the Mediar org. Compiled in
+/// because this is a desktop app; users can opt out via `CLAUDE_METER_NO_SENTRY=1`.
+const SENTRY_DSN: &str = "https://2a67e355b17fd4e2da6cc2e135f765f8@o4507617161314304.ingest.us.sentry.io/4511372322209792";
+
+/// Log file path under ~/Library/Logs/ClaudeMeter/menubar.log. Lazily opened
+/// the first time `log_line` runs; appended to until the process exits. No
+/// rotation — desktop app, low write volume, user can `truncate` if it grows.
+static LOG_FILE: Mutex<Option<std::fs::File>> = Mutex::new(None);
+
+fn log_dir() -> Option<PathBuf> {
+    dirs::home_dir().map(|p| p.join("Library").join("Logs").join("ClaudeMeter"))
+}
+
+fn open_log_file() -> Option<std::fs::File> {
+    let dir = log_dir()?;
+    std::fs::create_dir_all(&dir).ok()?;
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("menubar.log"))
+        .ok()
+}
+
+/// Emit a log line: stderr + log file + Sentry breadcrumb. Use `log_warn` for
+/// anything user-visible (429s, alarms, fetch failures); use `log_error` for
+/// things we want as Sentry events, not just breadcrumbs.
+fn log_line(level: &str, msg: &str) {
+    let ts = Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
+    let line = format!("{ts} [{level}] {msg}");
+    eprintln!("{line}");
+    if let Ok(mut guard) = LOG_FILE.lock() {
+        if guard.is_none() {
+            *guard = open_log_file();
+        }
+        if let Some(f) = guard.as_mut() {
+            let _ = writeln!(f, "{line}");
+            let _ = f.flush();
+        }
+    }
+    let sentry_level = match level {
+        "error" => sentry::Level::Error,
+        "warn" => sentry::Level::Warning,
+        _ => sentry::Level::Info,
+    };
+    sentry::add_breadcrumb(sentry::Breadcrumb {
+        category: Some("menubar".into()),
+        level: sentry_level,
+        message: Some(msg.into()),
+        ..Default::default()
+    });
+}
+
+fn log_info(msg: &str) { log_line("info", msg); }
+fn log_warn(msg: &str) { log_line("warn", msg); }
+fn log_error(msg: &str) {
+    log_line("error", msg);
+    sentry::capture_message(msg, sentry::Level::Error);
+}
 
 /// Smart adaptive polling for /api/oauth/usage. The endpoint is an internal
 /// Anthropic surface with no published rate limit, and our token is also being
@@ -120,6 +181,30 @@ enum AppEvent {
 }
 
 fn main() -> Result<()> {
+    // Sentry init before anything else so panics in startup are captured.
+    // Held in a binding so the guard isn't dropped until the process exits.
+    let _sentry_guard = if std::env::var("CLAUDE_METER_NO_SENTRY").is_err() {
+        Some(sentry::init((
+            SENTRY_DSN,
+            sentry::ClientOptions {
+                release: Some(format!("claude-meter@{}", env!("CARGO_PKG_VERSION")).into()),
+                environment: Some(
+                    if cfg!(debug_assertions) { "debug" } else { "release" }.into(),
+                ),
+                attach_stacktrace: true,
+                send_default_pii: false,
+                ..Default::default()
+            },
+        )))
+    } else {
+        None
+    };
+    log_info(&format!(
+        "claude-meter v{} starting (sentry={})",
+        env!("CARGO_PKG_VERSION"),
+        _sentry_guard.is_some()
+    ));
+
     #[cfg(target_os = "macos")]
     set_macos_accessory();
 
@@ -239,10 +324,10 @@ fn main() -> Result<()> {
                         && util >= ALARM_THRESHOLD
                         && config.alarm_enabled
                     {
-                        eprintln!(
+                        log_warn(&format!(
                             "alarm: 5h utilization {:.1}% >= {:.0}% — firing",
                             util, ALARM_THRESHOLD
-                        );
+                        ));
                         play_alarm_sound();
                         post_alarm_notification(util);
                         last_alarm_window = resets_at.or(Some(chrono::Utc::now()));
@@ -539,6 +624,7 @@ fn poll_loop(
     {
         Ok(rt) => rt,
         Err(e) => {
+            log_error(&format!("could not start tokio runtime: {e}"));
             let _ = proxy.send_event(AppEvent::Snapshots(Err(format!(
                 "could not start tokio runtime: {e}"
             ))));
@@ -581,11 +667,11 @@ fn poll_loop(
         let wait = if rate_limited {
             let idx = consecutive_429s.min(RATE_LIMIT_BACKOFF_LADDER.len() - 1);
             let dur = RATE_LIMIT_BACKOFF_LADDER[idx];
-            eprintln!(
+            log_warn(&format!(
                 "rate-limited by anthropic (consecutive={}); backing off for {}s",
                 consecutive_429s + 1,
                 dur.as_secs()
-            );
+            ));
             consecutive_429s = consecutive_429s.saturating_add(1);
             dur
         } else {
@@ -599,12 +685,12 @@ fn poll_loop(
                         unchanged_streak = 0;
                     }
                     last_snaps = new_snaps;
-                    eprintln!(
+                    log_info(&format!(
                         "next poll in {}s (streak={}, accounts={})",
                         interval.as_secs(),
                         unchanged_streak,
                         last_snaps.len()
-                    );
+                    ));
                     interval
                 }
                 None => POLL_BASE,
@@ -766,7 +852,7 @@ async fn fetch_all() -> Result<Vec<UsageSnapshot>, String> {
     match oauth::fetch_oauth_snapshot().await {
         Ok(s) => Ok(vec![s]),
         Err(e) => {
-            eprintln!("warn: oauth fetch failed: {e:#}");
+            log_warn(&format!("oauth fetch failed: {e:#}"));
             Err(format!("oauth: {e:#}"))
         }
     }
