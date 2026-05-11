@@ -14,7 +14,13 @@ use tray_icon::menu::{
 };
 use tray_icon::{TrayIcon, TrayIconBuilder, TrayIconEvent};
 
-const POLL_INTERVAL: Duration = Duration::from_secs(60);
+/// Poll cadence for /api/oauth/usage. Was 60s; bumped to 180s on 2026-05-10
+/// because the endpoint kept 429-ing under the old cadence (it's an internal
+/// Anthropic endpoint with no published limit, and our token is also being
+/// hit by the actual Claude Code CLI in parallel). The 5h window only ticks
+/// when CLI burns tokens, so 3-min granularity is plenty for a menu-bar
+/// number, and it cuts our request rate ~3x.
+const POLL_INTERVAL: Duration = Duration::from_secs(180);
 
 /// Backoff schedule after Anthropic returns 429. The first 429 is often a
 /// per-minute bucket transient and clears in 60-90s, so a long wait is
