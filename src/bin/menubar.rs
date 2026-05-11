@@ -75,6 +75,19 @@ fn log_error(msg: &str) {
     sentry::capture_message(msg, sentry::Level::Error);
 }
 
+/// Capture a real Sentry event (not just a breadcrumb) at the given level.
+/// Use sparingly: for things we want to be able to query in Sentry, like
+/// alarm fires or process startup, not for routine 429 backoffs.
+fn log_capture(level: &str, msg: &str) {
+    log_line(level, msg);
+    let sentry_level = match level {
+        "error" => sentry::Level::Error,
+        "warn" => sentry::Level::Warning,
+        _ => sentry::Level::Info,
+    };
+    sentry::capture_message(msg, sentry_level);
+}
+
 /// Smart adaptive polling for /api/oauth/usage. The endpoint is an internal
 /// Anthropic surface with no published rate limit, and our token is also being
 /// hit by the actual Claude Code CLI in parallel, so a fixed cadence is wrong:
@@ -199,11 +212,21 @@ fn main() -> Result<()> {
     } else {
         None
     };
-    log_info(&format!(
-        "claude-meter v{} starting (sentry={})",
-        env!("CARGO_PKG_VERSION"),
-        _sentry_guard.is_some()
-    ));
+    // Heartbeat: capture a real Sentry event on every launch so we can confirm
+    // the SDK in the installed binary is reaching Sentry. Cheap (one event per
+    // process start, not per poll) and gives an unambiguous "is the wiring
+    // alive?" signal in the Sentry UI.
+    if _sentry_guard.is_some() {
+        log_capture(
+            "info",
+            &format!("claude-meter v{} startup heartbeat", env!("CARGO_PKG_VERSION")),
+        );
+    } else {
+        log_info(&format!(
+            "claude-meter v{} starting (sentry disabled)",
+            env!("CARGO_PKG_VERSION")
+        ));
+    }
 
     #[cfg(target_os = "macos")]
     set_macos_accessory();
@@ -324,10 +347,13 @@ fn main() -> Result<()> {
                         && util >= ALARM_THRESHOLD
                         && config.alarm_enabled
                     {
-                        log_warn(&format!(
-                            "alarm: 5h utilization {:.1}% >= {:.0}% — firing",
-                            util, ALARM_THRESHOLD
-                        ));
+                        log_capture(
+                            "warn",
+                            &format!(
+                                "alarm: 5h utilization {:.1}% >= {:.0}% — firing",
+                                util, ALARM_THRESHOLD
+                            ),
+                        );
                         play_alarm_sound();
                         post_alarm_notification(util);
                         last_alarm_window = resets_at.or(Some(chrono::Utc::now()));
