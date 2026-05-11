@@ -14,13 +14,24 @@ use tray_icon::menu::{
 };
 use tray_icon::{TrayIcon, TrayIconBuilder, TrayIconEvent};
 
-/// Poll cadence for /api/oauth/usage. Was 60s; bumped to 180s on 2026-05-10
-/// because the endpoint kept 429-ing under the old cadence (it's an internal
-/// Anthropic endpoint with no published limit, and our token is also being
-/// hit by the actual Claude Code CLI in parallel). The 5h window only ticks
-/// when CLI burns tokens, so 3-min granularity is plenty for a menu-bar
-/// number, and it cuts our request rate ~3x.
-const POLL_INTERVAL: Duration = Duration::from_secs(180);
+/// Smart adaptive polling for /api/oauth/usage. The endpoint is an internal
+/// Anthropic surface with no published rate limit, and our token is also being
+/// hit by the actual Claude Code CLI in parallel, so a fixed cadence is wrong:
+/// too-fast triggers 429s, too-slow leaves the bar stale during active use.
+///
+/// Strategy (see `smart_interval`):
+///   - HIGH-USE FAST PATH: if any window utilization ≥ 80%, poll every 90s so
+///     the alarm threshold (95%) and the title number stay responsive.
+///   - ACTIVITY FAST PATH: if the last snapshot's numbers changed, poll again
+///     in 90s (active CLI session, numbers will keep moving).
+///   - IDLE GEOMETRIC SLOWDOWN: when the snapshot is identical N polls in a
+///     row, back off 180s → 240s → 320s → 420s → 600s. Reset on any change.
+const POLL_MIN: Duration = Duration::from_secs(90);
+const POLL_BASE: Duration = Duration::from_secs(180);
+const POLL_MAX: Duration = Duration::from_secs(600);
+/// Utilization (%) at or above which we switch to the fast cadence. Sits below
+/// the alarm threshold so the user gets multiple ticks of warning before fire.
+const HIGH_UTIL_FAST_POLL: f64 = 80.0;
 
 /// Backoff schedule after Anthropic returns 429. The first 429 is often a
 /// per-minute bucket transient and clears in 60-90s, so a long wait is
@@ -480,6 +491,44 @@ fn account_set_changed(a: &[UsageSnapshot], b: &[UsageSnapshot]) -> bool {
     ak != bk
 }
 
+/// Pick the next poll interval based on what the last successful fetch showed.
+/// See the `POLL_MIN`/`POLL_BASE`/`POLL_MAX` doc-comment for the strategy.
+fn smart_interval(
+    last_snaps: &[UsageSnapshot],
+    new_snaps: &[UsageSnapshot],
+    unchanged_streak: u32,
+) -> Duration {
+    // High-utilization fast path: if any window is in the danger zone, keep
+    // the bar (and the alarm threshold check) responsive.
+    let high_util = new_snaps.iter().any(|s| {
+        let Some(u) = s.usage.as_ref() else { return false };
+        let any = |w: Option<&claude_meter::models::Window>| {
+            w.map(|w| w.utilization >= HIGH_UTIL_FAST_POLL).unwrap_or(false)
+        };
+        any(u.five_hour.as_ref())
+            || any(u.seven_day.as_ref())
+            || any(u.seven_day_sonnet.as_ref())
+            || any(u.seven_day_opus.as_ref())
+    });
+    if high_util {
+        return POLL_MIN;
+    }
+    // Activity fast path: if the numbers (or account set) changed since the
+    // last good snapshot, the CLI is burning tokens — poll again soon.
+    if !last_snaps.is_empty() && !snaps_equal(last_snaps, new_snaps) {
+        return POLL_MIN;
+    }
+    // Idle geometric slowdown. unchanged_streak counts consecutive identical
+    // snapshots *after* the first one, so streak=0 still gets POLL_BASE.
+    match unchanged_streak {
+        0..=1 => POLL_BASE,
+        2 => Duration::from_secs(240),
+        3 => Duration::from_secs(320),
+        4 => Duration::from_secs(420),
+        _ => POLL_MAX,
+    }
+}
+
 fn poll_loop(
     proxy: EventLoopProxy<AppEvent>,
     refresh_rx: mpsc::Receiver<()>,
@@ -509,12 +558,23 @@ fn poll_loop(
     // a longer-window cap and need a longer wait. A successful fetch resets
     // the counter. The Refresh menu button bypasses the wait via refresh_rx.
     let mut consecutive_429s: usize = 0;
+    // Smart-interval state: last good snapshot + count of consecutive identical
+    // polls. Cleared on any rate-limit (we don't trust those values).
+    let mut last_snaps: Vec<UsageSnapshot> = Vec::new();
+    let mut unchanged_streak: u32 = 0;
     loop {
         let _ = proxy.send_event(AppEvent::Refreshing);
         let result = rt.block_on(fetch_all());
         let rate_limited = match &result {
             Err(e) => is_rate_limit_error(e),
             Ok(_) => false,
+        };
+        // Snapshot a copy *before* moving `result` into the event so the smart
+        // interval can compare against last_snaps after the menu has already
+        // been updated.
+        let new_snaps_copy: Option<Vec<UsageSnapshot>> = match &result {
+            Ok(s) => Some(s.clone()),
+            Err(_) => None,
         };
         let _ = proxy.send_event(AppEvent::Snapshots(result));
 
@@ -530,7 +590,25 @@ fn poll_loop(
             dur
         } else {
             consecutive_429s = 0;
-            POLL_INTERVAL
+            match new_snaps_copy {
+                Some(new_snaps) => {
+                    let interval = smart_interval(&last_snaps, &new_snaps, unchanged_streak);
+                    if !last_snaps.is_empty() && snaps_equal(&last_snaps, &new_snaps) {
+                        unchanged_streak = unchanged_streak.saturating_add(1);
+                    } else {
+                        unchanged_streak = 0;
+                    }
+                    last_snaps = new_snaps;
+                    eprintln!(
+                        "next poll in {}s (streak={}, accounts={})",
+                        interval.as_secs(),
+                        unchanged_streak,
+                        last_snaps.len()
+                    );
+                    interval
+                }
+                None => POLL_BASE,
+            }
         };
         let _ = refresh_rx.recv_timeout(wait);
         while refresh_rx.try_recv().is_ok() {}
