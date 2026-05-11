@@ -1,6 +1,6 @@
 [package]
 name = "claude-meter"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2021"
 license = "MIT"
 description = "Live Claude plan usage and extra-usage balance from the terminal"
@@ -39,6 +39,10 @@ chrono = { version = "0.4", features = ["serde"] }
 tray-icon = "0.19"
 tao = "0.30"
 png = "0.17"
+sentry = { version = "0.34", default-features = false, features = ["backtrace", "contexts", "panic", "reqwest", "rustls"] }
+sentry-log = "0.34"
+log = "0.4"
+env_logger = "0.11"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.5"
