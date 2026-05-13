@@ -153,10 +153,28 @@ async fn get_json<T: serde::de::DeserializeOwned>(
         .await
         .with_context(|| format!("GET {url}"))?;
     let status = resp.status();
+    // Capture Retry-After before we move the response. Only meaningful on
+    // 429; other statuses sometimes echo a stale header value. RFC 7231 says
+    // it's either delta-seconds or an HTTP-date — Anthropic returns seconds.
+    // We surface it through the error message so the menubar's poll loop
+    // can sleep for the server-requested duration instead of guessing.
+    let retry_after = if status.as_u16() == 429 {
+        resp.headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.trim().parse::<u64>().ok())
+    } else {
+        None
+    };
     let body = resp.text().await.unwrap_or_default();
     if !status.is_success() {
         let snippet = &body[..body.len().min(300)];
-        anyhow::bail!("HTTP {status} from {url}: {snippet}");
+        match retry_after {
+            Some(secs) => anyhow::bail!(
+                "HTTP {status} from {url} (retry-after={secs}s): {snippet}"
+            ),
+            None => anyhow::bail!("HTTP {status} from {url}: {snippet}"),
+        }
     }
     serde_json::from_str::<T>(&body).with_context(|| {
         let snippet = &body[..body.len().min(300)];
