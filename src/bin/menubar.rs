@@ -130,6 +130,14 @@ const ALARM_SOUND_PATH: &str = "/System/Library/Sounds/Sosumi.aiff";
 /// an alarm; one feels like a notification ping.
 const ALARM_REPEATS: usize = 3;
 
+/// Cadence of the menu-bar blink at/over the alarm threshold. 500ms reads as
+/// "blinking", not "flickering", and is still fast enough to grab attention
+/// from peripheral vision.
+const BLINK_INTERVAL: Duration = Duration::from_millis(500);
+
+/// RGB for the "alert" phase of the blink and for the >=100% solid color.
+const BLINK_RED: (u8, u8, u8) = (215, 58, 73);
+
 /// The browser tag set by the OAuth source (`oauth::fetch_oauth_snapshot`).
 /// Used to identify the active Claude Code CLI account vs cookie-sourced
 /// snapshots from other browser logins.
@@ -191,6 +199,10 @@ impl Default for Config {
 enum AppEvent {
     Refreshing,
     Snapshots(Result<Vec<UsageSnapshot>, String>),
+    /// Fires on a fixed cadence from the blink ticker thread. Only does work
+    /// when the visual alarm is active (utilization >= ALARM_THRESHOLD and the
+    /// user hasn't dismissed it for the current window).
+    BlinkTick,
 }
 
 fn main() -> Result<()> {
@@ -241,6 +253,7 @@ fn main() -> Result<()> {
 
     let event_loop = EventLoopBuilder::<AppEvent>::with_user_event().build();
     let proxy = event_loop.create_proxy();
+    let blink_proxy = event_loop.create_proxy();
     let (refresh_tx, refresh_rx) = mpsc::channel::<()>();
 
     // Bridge listener (port 63762) was the legacy cookie-source path that
@@ -250,6 +263,20 @@ fn main() -> Result<()> {
     // anyway. We also saw the bridge holding duplicate FDs per long-lived
     // keepalive connection (Chrome + Brave each kept 2 FDs open). Removed.
     std::thread::spawn(move || poll_loop(proxy, refresh_rx));
+
+    // Blink ticker. Sends BlinkTick on a fixed cadence regardless of state;
+    // the event handler short-circuits when the visual alarm isn't active.
+    // Cheap (2 events/sec, all integer work), and keeping the cadence steady
+    // means turning the blink on/off doesn't require thread coordination.
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(BLINK_INTERVAL);
+            if blink_proxy.send_event(AppEvent::BlinkTick).is_err() {
+                // Event loop closed (app exiting) — stop ticking.
+                break;
+            }
+        }
+    });
 
     let (menu, ids) = build_initial_menu();
     let mut builder = TrayIconBuilder::new()
@@ -269,6 +296,14 @@ fn main() -> Result<()> {
     let _tray_channel = TrayIconEvent::receiver();
     let mut current_ids = ids;
     let mut last_fetched: Option<DateTime<Local>> = None;
+    // Visual-alarm state. `blink` carries what gets painted right now;
+    // `blink_dismissed` is the latch the user flips from the menu to silence
+    // the blink for the current 5-hour window. The latch clears automatically
+    // when the window rolls over or utilization drops back below threshold,
+    // so the next high reading re-arms the visual without persisting state to
+    // disk.
+    let mut blink = BlinkState::OFF;
+    let mut blink_dismissed = false;
     let persisted = load_snapshots();
     let mut last_snaps: Option<Vec<UsageSnapshot>> = if persisted.is_empty() {
         None
@@ -280,6 +315,7 @@ fn main() -> Result<()> {
                 last_fetched,
                 config.title_format,
                 config.alarm_enabled,
+                blink.active,
             );
         }
         Some(persisted)
@@ -298,6 +334,7 @@ fn main() -> Result<()> {
             None,
             config.title_format,
             config.preferred_browser.as_deref(),
+            blink,
         );
     }
 
@@ -504,10 +541,30 @@ fn render_menu_only(
     fetched: Option<DateTime<Local>>,
     fmt: TitleFormat,
     alarm_enabled: bool,
+    alarm_visual_active: bool,
 ) -> MenuIds {
-    let (menu, ids) = build_menu(snaps, fetched, fmt, alarm_enabled);
+    let (menu, ids) = build_menu(snaps, fetched, fmt, alarm_enabled, alarm_visual_active);
     let _ = tray.set_menu(Some(Box::new(menu)));
     ids
+}
+
+/// Visual state for the at-threshold alarm. Independent of the audio alarm:
+/// the sound fires once when the window first crosses 95%, but the visual
+/// keeps blinking until utilization drops back below threshold, the user
+/// dismisses it, or the 5-hour window rolls over.
+#[derive(Clone, Copy)]
+struct BlinkState {
+    /// Whether the blink should currently be expressed visually.
+    active: bool,
+    /// Toggles every `BLINK_INTERVAL`. When true, override every segment's bg
+    /// to red; when false, strip all backgrounds for the "off" phase. This
+    /// reads as a clear, full-text "back-and-forth" without losing the
+    /// percentage number.
+    red_phase: bool,
+}
+
+impl BlinkState {
+    const OFF: BlinkState = BlinkState { active: false, red_phase: false };
 }
 
 fn apply_title(
@@ -516,6 +573,7 @@ fn apply_title(
     error: Option<&str>,
     fmt: TitleFormat,
     preferred_browser: Option<&str>,
+    blink: BlinkState,
 ) {
     // Title precedence:
     //   - have snaps: render them, even if the latest fetch errored. Append
@@ -524,7 +582,7 @@ fn apply_title(
     //     429 backoff).
     //   - no snaps + error: bare "Claude: !" (we have nothing else to show).
     //   - no snaps + no error: "Claude: …" (still loading).
-    let segs = if let Some(s) = snaps {
+    let mut segs = if let Some(s) = snaps {
         let mut segs = title_segments(fmt, s, preferred_browser);
         if error.is_some() {
             segs.push(TitleSeg { text: " !".into(), bg: None });
@@ -535,6 +593,17 @@ fn apply_title(
     } else {
         vec![TitleSeg { text: "Claude: …".into(), bg: None }]
     };
+
+    // Blink override: when active, force every segment's background to a
+    // uniform red on the "on" phase and clear all backgrounds on the "off"
+    // phase. We override rather than additively layer so the whole bar
+    // visibly flips together, which is what the user asked for.
+    if blink.active {
+        let bg = if blink.red_phase { Some(BLINK_RED) } else { None };
+        for s in segs.iter_mut() {
+            s.bg = bg;
+        }
+    }
 
     #[cfg(target_os = "macos")]
     let applied = {
@@ -892,6 +961,10 @@ struct MenuIds {
     alarm_toggle: Option<MenuId>,
     /// "Test alarm sound" — fires the alarm on demand.
     alarm_test: Option<MenuId>,
+    /// "Dismiss alarm" item, only present while the visual alarm (blinking
+    /// title) is active. Clicking it silences the blink for the current
+    /// 5-hour window; the blink re-arms automatically when the window rolls.
+    dismiss_alarm: Option<MenuId>,
     open_urls: HashMap<MenuId, String>,
     format_items: HashMap<MenuId, TitleFormat>,
     forget_account: HashMap<MenuId, String>,
@@ -904,6 +977,7 @@ impl MenuIds {
             quit,
             alarm_toggle: None,
             alarm_test: None,
+            dismiss_alarm: None,
             open_urls: HashMap::new(),
             format_items: HashMap::new(),
             forget_account: HashMap::new(),
@@ -940,11 +1014,26 @@ fn build_menu(
     fetched: Option<DateTime<Local>>,
     fmt: TitleFormat,
     alarm_enabled: bool,
+    alarm_visual_active: bool,
 ) -> (Menu, MenuIds) {
     let menu = Menu::new();
     let mut open_urls = HashMap::new();
     let mut format_items = HashMap::new();
     let mut forget_account: HashMap<MenuId, String> = HashMap::new();
+
+    // When the visual alarm is firing (utilization >= 95%, not yet dismissed
+    // for the current 5-hour window), the very first item is a one-click
+    // "Dismiss alarm" so the user can stop the blinking without hunting through
+    // submenus.
+    let dismiss_alarm = if alarm_visual_active {
+        let item = MenuItem::new("Dismiss alarm", true, None);
+        let id = item.id().clone();
+        menu.append(&item).ok();
+        menu.append(&PredefinedMenuItem::separator()).ok();
+        Some(id)
+    } else {
+        None
+    };
 
     for (i, s) in snaps.iter().enumerate() {
         let label = account_label(s);
@@ -1077,6 +1166,7 @@ fn build_menu(
             quit: quit.id().clone(),
             alarm_toggle: Some(alarm_toggle.id().clone()),
             alarm_test: Some(alarm_test.id().clone()),
+            dismiss_alarm,
             open_urls,
             format_items,
             forget_account,
@@ -1250,7 +1340,7 @@ struct TitleSeg {
 
 fn bg_for(util: f64) -> Option<(u8, u8, u8)> {
     if util >= 100.0 {
-        Some((215, 58, 73))
+        Some(BLINK_RED)
     } else if util >= 90.0 {
         Some((219, 118, 32))
     } else {
