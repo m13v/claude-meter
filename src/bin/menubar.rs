@@ -1509,9 +1509,9 @@ fn title_segments(
     snaps: &[UsageSnapshot],
     preferred_browser: Option<&str>,
 ) -> Vec<TitleSeg> {
+    // First pass: only non-stale snapshots, filtered by preferred browser if
+    // available. This is the happy path during normal operation.
     let live_all: Vec<&UsageSnapshot> = snaps.iter().filter(|s| !s.stale).collect();
-    // When the user has a preferred browser and at least one snapshot matches,
-    // show only that account in the title. Otherwise fall back to all live snaps.
     let live: Vec<&UsageSnapshot> = match preferred_browser {
         Some(want) => {
             let want_lc = want.to_lowercase();
@@ -1524,6 +1524,30 @@ fn title_segments(
         }
         None => live_all,
     };
+
+    // Fallback: when no fresh snapshot is available (post-restart with only
+    // persisted data, or an extended 429 backoff), show the last-known
+    // numbers from any stale snapshot rather than the uninformative "—".
+    // The caller adds a " !" suffix when there's an active error, so the
+    // user still sees "Claude 5h 6% · 7d 1% !" instead of "Claude: — !".
+    let live: Vec<&UsageSnapshot> = if !live.is_empty() {
+        live
+    } else {
+        let all: Vec<&UsageSnapshot> = snaps.iter().collect();
+        match preferred_browser {
+            Some(want) => {
+                let want_lc = want.to_lowercase();
+                let filtered: Vec<&UsageSnapshot> = all
+                    .iter()
+                    .copied()
+                    .filter(|s| pretty_browser(&s.browser).to_lowercase() == want_lc)
+                    .collect();
+                if filtered.is_empty() { all } else { filtered }
+            }
+            None => all,
+        }
+    };
+
     let mut segs: Vec<TitleSeg> = Vec::new();
     if live.is_empty() {
         segs.push(TitleSeg {
