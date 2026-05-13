@@ -25,11 +25,11 @@ DMG_PATH="$OUT_DIR/$APP_NAME-$VERSION.dmg"
 ZIP_PATH="$OUT_DIR/$APP_NAME-$VERSION.zip"
 ENTITLEMENTS="scripts/entitlements.plist"
 
-echo "[1/8] building release binaries..."
+echo "[1/9] building release binaries..."
 bash scripts/build-icons.sh
 cargo build --release --bin claude-meter --bin claude-meter-menubar
 
-echo "[2/8] assembling $APP_BUNDLE..."
+echo "[2/9] assembling $APP_BUNDLE..."
 rm -rf "$APP_BUNDLE"
 mkdir -p "$APP_BUNDLE/Contents/MacOS"
 mkdir -p "$APP_BUNDLE/Contents/Resources"
@@ -57,7 +57,7 @@ cat > "$APP_BUNDLE/Contents/Info.plist" <<PLIST
 </plist>
 PLIST
 
-echo "[3/8] codesigning (hardened runtime, Developer ID)..."
+echo "[3/9] codesigning (hardened runtime, Developer ID)..."
 # Sign the inner CLI binary first, then the bundle (which picks up the main executable).
 codesign --force --options runtime --timestamp \
     --entitlements "$ENTITLEMENTS" \
@@ -69,23 +69,23 @@ codesign --force --options runtime --timestamp \
     "$APP_BUNDLE"
 codesign --verify --deep --strict --verbose=2 "$APP_BUNDLE"
 
-echo "[4/8] submitting for notarization (this takes ~1-3 min)..."
+echo "[4/9] submitting for notarization (this takes ~1-3 min)..."
 ditto -c -k --keepParent "$APP_BUNDLE" "$OUT_DIR/notarize.zip"
 xcrun notarytool submit "$OUT_DIR/notarize.zip" \
     --keychain-profile "$NOTARY_PROFILE" \
     --wait
 rm -f "$OUT_DIR/notarize.zip"
 
-echo "[5/8] stapling notarization ticket..."
+echo "[5/9] stapling notarization ticket..."
 xcrun stapler staple "$APP_BUNDLE"
 xcrun stapler validate "$APP_BUNDLE"
 spctl --assess --type execute --verbose "$APP_BUNDLE" || true
 
-echo "[6/8] producing a zipped .app for direct download..."
+echo "[6/9] producing a zipped .app for direct download..."
 rm -f "$ZIP_PATH"
 ditto -c -k --keepParent "$APP_BUNDLE" "$ZIP_PATH"
 
-echo "[7/8] building + signing DMG (notarization optional via SKIP_DMG_NOTARIZE=1)..."
+echo "[7/9] building + signing DMG (notarization optional via SKIP_DMG_NOTARIZE=1)..."
 rm -f "$DMG_PATH"
 STAGING="$OUT_DIR/dmg-staging-$$"
 rm -rf "$STAGING"
@@ -102,7 +102,7 @@ else
     xcrun stapler staple "$DMG_PATH"
 fi
 
-echo "[8/8] publishing GitHub release v$VERSION (assets: DMG + zip)..."
+echo "[8/9] publishing GitHub release v$VERSION (assets: DMG + zip)..."
 # Without this step the website's /api/download endpoint keeps serving the
 # previous release's DMG (it polls api.github.com/.../releases/latest), so
 # users get the old version after a tag-only push. Idempotent: if the release
@@ -135,6 +135,42 @@ else
                 "$DMG_PATH" "$ZIP_PATH"
         fi
         echo "   published: https://github.com/$REPO/releases/tag/v$VERSION"
+    fi
+fi
+
+echo "[9/9] bumping homebrew tap (m13v/homebrew-tap → Casks/claude-meter.rb)..."
+# The brew cask pins version + sha256 of the .zip asset on GitHub. Without
+# this step `brew upgrade --cask m13v/tap/claude-meter` keeps installing the
+# old version even after the GitHub release flips.
+if [ "${SKIP_BREW_TAP:-0}" = "1" ]; then
+    echo "   skipping homebrew tap bump (SKIP_BREW_TAP=1)."
+else
+    TAP_DIR="${TAP_DIR:-$HOME/homebrew-tap}"
+    TAP_REPO="m13v/homebrew-tap"
+    CASK_PATH="$TAP_DIR/Casks/claude-meter.rb"
+    GH_BIN="${GH_BIN:-$(command -v gh || echo /opt/homebrew/bin/gh)}"
+    if [ ! -d "$TAP_DIR/.git" ]; then
+        echo "   cloning $TAP_REPO → $TAP_DIR..."
+        "$GH_BIN" repo clone "$TAP_REPO" "$TAP_DIR"
+    else
+        (cd "$TAP_DIR" && git pull --quiet --rebase origin main)
+    fi
+    if [ ! -f "$CASK_PATH" ]; then
+        echo "   cask file not found at $CASK_PATH; aborting brew bump." >&2
+        exit 1
+    fi
+    ZIP_SHA="$(shasum -a 256 "$ZIP_PATH" | awk '{print $1}')"
+    # macOS sed needs the empty '' arg for -i.
+    sed -i '' -E "s/^  version \".*\"/  version \"$VERSION\"/" "$CASK_PATH"
+    sed -i '' -E "s/^  sha256 \".*\"/  sha256 \"$ZIP_SHA\"/" "$CASK_PATH"
+    if (cd "$TAP_DIR" && git diff --quiet -- "Casks/claude-meter.rb"); then
+        echo "   cask already at $VERSION + sha256 $ZIP_SHA; nothing to commit."
+    else
+        (cd "$TAP_DIR" \
+            && git add Casks/claude-meter.rb \
+            && git commit -m "claude-meter: bump to $VERSION" \
+            && git push origin main)
+        echo "   pushed cask bump."
     fi
 fi
 

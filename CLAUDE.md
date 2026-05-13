@@ -10,8 +10,8 @@
 2. **Commit** the bump: `git commit -m "chore: release v<VERSION>"`.
 3. **Tag**: `git tag v<VERSION>`.
 4. **Push branch + tag**: `git push origin main && git push origin v<VERSION>`.
-5. **Run `bash scripts/release.sh`.** This builds, codesigns (Developer ID), notarizes, staples, builds the DMG, notarizes the DMG, AND publishes the GitHub release with the DMG + zip uploaded (step 8/8 in the script as of 2026-05-13).
-6. **Verify**: `curl -s https://api.github.com/repos/m13v/claude-meter/releases/latest | jq -r '.tag_name + " — " + (.assets | map(.name) | join(", "))'` must show the new tag and a `.dmg` asset.
+5. **Run `bash scripts/release.sh`.** This builds, codesigns (Developer ID), notarizes, staples, builds the DMG, notarizes the DMG, publishes the GitHub release with DMG + zip uploaded, AND bumps the homebrew tap (`m13v/homebrew-tap → Casks/claude-meter.rb`). 9 steps total as of 2026-05-13.
+6. **Verify**: `curl -s https://api.github.com/repos/m13v/claude-meter/releases/latest | jq -r '.tag_name + " — " + (.assets | map(.name) | join(", "))'` must show the new tag and a `.dmg` asset. Also `brew bump-cask-pr --version=… --dry-run m13v/tap/claude-meter` or just `cat ~/homebrew-tap/Casks/claude-meter.rb` to confirm the cask points at the new version + sha256.
 
 ### Required toolchain on PATH
 
@@ -33,7 +33,8 @@ The script uses keychain profile `claude-meter-notary` for `xcrun notarytool`. I
 
 - `SKIP_DMG_NOTARIZE=1` — sign the DMG but skip its notarization (zip is still notarized + stapled). Don't use for real releases.
 - `SKIP_GH_RELEASE=1` — skip the GitHub release publish step. Don't use for real releases; the website will serve the stale version.
+- `SKIP_BREW_TAP=1` — skip the homebrew tap bump. Don't use for real releases; `brew upgrade --cask m13v/tap/claude-meter` will keep installing the old version.
 
 ### Homebrew tap
 
-`brew install --cask m13v/tap/claude-meter` points at a separate `homebrew-tap` repo. If the cask formula has the version pinned, it needs a bump there too. The website download flow does NOT use brew; it pulls the DMG straight from the GitHub release.
+`brew install --cask m13v/tap/claude-meter` points at the `m13v/homebrew-tap` repo. `scripts/release.sh` step [9/9] auto-bumps `Casks/claude-meter.rb` (version + sha256 of the new zip) and pushes to main. The local clone defaults to `~/homebrew-tap`; override with `TAP_DIR=/path` if needed. The website download flow does NOT use brew; it pulls the DMG straight from the GitHub release.
