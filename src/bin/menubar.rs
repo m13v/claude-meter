@@ -860,6 +860,25 @@ fn poll_loop(
     // polls. Cleared on any rate-limit (we don't trust those values).
     let mut last_snaps: Vec<UsageSnapshot> = Vec::new();
     let mut unchanged_streak: u32 = 0;
+
+    // Honor any backoff deadline persisted from a previous run. If we
+    // restarted in the middle of a server-driven Retry-After window, we owe
+    // Anthropic the rest of that wait — polling immediately on startup would
+    // burn an attempt and likely re-extend the lockout. The Refresh menu
+    // item still wakes us early via refresh_rx, so the user has an explicit
+    // override if they want one.
+    if let Some(remaining) = load_backoff_remaining() {
+        log_info(&format!(
+            "respecting persisted backoff: {}s remaining (use Refresh to override)",
+            remaining.as_secs()
+        ));
+        let _ = refresh_rx.recv_timeout(remaining);
+        while refresh_rx.try_recv().is_ok() {}
+        // Treat startup like the consecutive=1 state — we don't know how
+        // deep the upstream lockout was, but we know one already happened.
+        consecutive_429s = 1;
+    }
+
     loop {
         let _ = proxy.send_event(AppEvent::Refreshing);
         let result = rt.block_on(fetch_all());
@@ -901,10 +920,15 @@ fn poll_loop(
                 dur.as_secs(),
                 source,
             ));
+            // Persist the deadline so a restart mid-backoff doesn't poll
+            // immediately and re-extend the upstream window. Cleared by
+            // clear_backoff() on the first successful fetch.
+            save_backoff_until(dur);
             consecutive_429s = consecutive_429s.saturating_add(1);
             dur
         } else {
             consecutive_429s = 0;
+            clear_backoff();
             match new_snaps_copy {
                 Some(new_snaps) => {
                     let interval = smart_interval(&last_snaps, &new_snaps, unchanged_streak);
@@ -1461,6 +1485,52 @@ fn save_snapshots(snaps: &[UsageSnapshot]) {
     }
     if let Ok(s) = serde_json::to_string_pretty(snaps) {
         let _ = std::fs::write(&path, s);
+    }
+}
+
+// Backoff deadline persistence. When Anthropic gives us a `Retry-After`, we
+// drop the unix-epoch second of the deadline into a tiny file next to
+// snapshots.json. On the next startup we check it before polling so a restart
+// (manual quit, crash, install) doesn't knock the API and re-extend the
+// window. Cleared on the first successful fetch.
+fn backoff_path() -> Option<PathBuf> {
+    dirs::config_dir().map(|p| p.join("ClaudeMeter").join("backoff_until.txt"))
+}
+
+fn save_backoff_until(dur_from_now: Duration) {
+    let Some(path) = backoff_path() else { return };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let deadline = match std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+    {
+        Ok(d) => d + dur_from_now,
+        Err(_) => return,
+    };
+    let _ = std::fs::write(&path, deadline.as_secs().to_string());
+}
+
+fn load_backoff_remaining() -> Option<Duration> {
+    let path = backoff_path()?;
+    let s = std::fs::read_to_string(&path).ok()?;
+    let deadline_secs: u64 = s.trim().parse().ok()?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    if deadline_secs > now {
+        Some(Duration::from_secs(deadline_secs - now))
+    } else {
+        // Already past; clean up so it doesn't get re-loaded next time.
+        let _ = std::fs::remove_file(&path);
+        None
+    }
+}
+
+fn clear_backoff() {
+    if let Some(path) = backoff_path() {
+        let _ = std::fs::remove_file(&path);
     }
 }
 
