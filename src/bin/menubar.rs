@@ -120,7 +120,18 @@ const RATE_LIMIT_BACKOFF_LADDER: &[Duration] = &[
 ];
 
 /// Utilization (%) on the 5-hour rolling window at which the alarm fires.
-const ALARM_THRESHOLD: f64 = 95.0;
+const ALARM_THRESHOLD_DEFAULT: f64 = 95.0;
+
+/// Effective alarm threshold. Set `CLAUDE_METER_TEST_BLINK=1` in the env to
+/// drop the threshold to 0% — useful for verifying the visual blink and
+/// dismiss button without actually burning through 95% of a real plan window.
+fn alarm_threshold() -> f64 {
+    if std::env::var("CLAUDE_METER_TEST_BLINK").is_ok() {
+        0.0
+    } else {
+        ALARM_THRESHOLD_DEFAULT
+    }
+}
 
 /// System sound played when the alarm fires. Sosumi is the classic Mac alert
 /// tone — sharp enough to read as an alarm without sounding like a Slack ping.
@@ -399,21 +410,29 @@ fn main() -> Result<()> {
                         }
                     }
 
-                    if util >= ALARM_THRESHOLD && config.alarm_enabled {
+                    let threshold = alarm_threshold();
+                    if util >= threshold && config.alarm_enabled {
                         if !already_fired_this_window {
                             log_capture(
                                 "warn",
                                 &format!(
                                     "alarm: 5h utilization {:.1}% >= {:.0}% — firing",
-                                    util, ALARM_THRESHOLD
+                                    util, threshold
                                 ),
                             );
                             play_alarm_sound();
                             post_alarm_notification(util);
                             last_alarm_window = resets_at.or(Some(chrono::Utc::now()));
                         }
-                        // Visual stays on until dismissed or util drops.
-                        blink.active = !blink_dismissed;
+                        // Visual stays on until dismissed or util drops. When
+                        // we're flipping from off→on, start on the red phase
+                        // so the first paint is immediate red rather than
+                        // waiting half a tick for the first BlinkTick.
+                        let should_be_active = !blink_dismissed;
+                        if should_be_active && !blink.active {
+                            blink.red_phase = true;
+                        }
+                        blink.active = should_be_active;
                     } else {
                         // Below threshold (or alarm disabled): stop blinking
                         // and re-arm the dismiss latch so a future re-cross
@@ -1224,7 +1243,7 @@ fn build_menu(
     let alarm_toggle = CheckMenuItem::new(
         format!(
             "Sound alarm at {}% (5h window)",
-            ALARM_THRESHOLD as i64
+            alarm_threshold() as i64
         ),
         true,
         alarm_enabled,
