@@ -107,17 +107,30 @@ const POLL_MAX: Duration = Duration::from_secs(600);
 /// the alarm threshold so the user gets multiple ticks of warning before fire.
 const HIGH_UTIL_FAST_POLL: f64 = 80.0;
 
-/// Backoff schedule after Anthropic returns 429. The first 429 is often a
-/// per-minute bucket transient and clears in 60-90s, so a long wait is
-/// overkill and leaves the menu bar showing the error too long. Repeated
-/// 429s suggest the per-hour or per-day limit, where we want to back off
-/// more aggressively. Index = number of *consecutive* 429s already seen
-/// (saturating; the last entry repeats).
+/// Backoff schedule after Anthropic returns 429 *without* a `Retry-After`
+/// header. The first 429 is often a per-minute bucket transient and clears
+/// in 60-90s, so a long wait is overkill and leaves the menu bar showing
+/// the error too long. Repeated 429s suggest the per-hour or per-day limit,
+/// where we want to back off more aggressively. Index = number of
+/// *consecutive* 429s already seen (saturating; the last entry repeats).
+///
+/// When the server DOES send `Retry-After`, we honor it (clamped) and the
+/// ladder is bypassed entirely. Anthropic's `/api/oauth/usage` consistently
+/// returns Retry-After in seconds when the soft cap is hit; ignoring it and
+/// knocking every 5min just re-extends the window.
 const RATE_LIMIT_BACKOFF_LADDER: &[Duration] = &[
     Duration::from_secs(75),
     Duration::from_secs(180),
     Duration::from_secs(300),
 ];
+
+/// Upper bound on how long we'll honor a server-supplied `Retry-After`. The
+/// real Anthropic values we've observed are ~22 minutes; clamping at 30
+/// keeps a runaway header (or misconfigured proxy) from parking us for an
+/// hour. Lower bound is 30s — anything shorter is noise we'd rather absorb
+/// into the next natural poll.
+const RETRY_AFTER_MIN: Duration = Duration::from_secs(30);
+const RETRY_AFTER_MAX: Duration = Duration::from_secs(30 * 60);
 
 /// Utilization (%) on the 5-hour rolling window at which the alarm fires.
 const ALARM_THRESHOLD_DEFAULT: f64 = 95.0;
@@ -856,20 +869,37 @@ fn poll_loop(
         };
         // Snapshot a copy *before* moving `result` into the event so the smart
         // interval can compare against last_snaps after the menu has already
-        // been updated.
+        // been updated. Pull retry-after out here for the same reason.
         let new_snaps_copy: Option<Vec<UsageSnapshot>> = match &result {
             Ok(s) => Some(s.clone()),
             Err(_) => None,
         };
+        let retry_after_hint: Option<Duration> = match &result {
+            Err(e) => parse_retry_after_seconds(e)
+                .map(|secs| Duration::from_secs(secs).clamp(RETRY_AFTER_MIN, RETRY_AFTER_MAX)),
+            Ok(_) => None,
+        };
         let _ = proxy.send_event(AppEvent::Snapshots(result));
 
         let wait = if rate_limited {
-            let idx = consecutive_429s.min(RATE_LIMIT_BACKOFF_LADDER.len() - 1);
-            let dur = RATE_LIMIT_BACKOFF_LADDER[idx];
+            // Prefer the server-supplied Retry-After when present. The
+            // hardcoded ladder is only a fallback for 429s that don't carry
+            // a header — Anthropic's `/api/oauth/usage` does carry one, and
+            // ignoring it was burning attempts every 5min during a ~22min
+            // window, which probably re-extended that window each cycle.
+            let server_hint = retry_after_hint;
+            let (dur, source) = match server_hint {
+                Some(d) => (d, "server retry-after"),
+                None => {
+                    let idx = consecutive_429s.min(RATE_LIMIT_BACKOFF_LADDER.len() - 1);
+                    (RATE_LIMIT_BACKOFF_LADDER[idx], "ladder")
+                }
+            };
             log_warn(&format!(
-                "rate-limited by anthropic (consecutive={}); backing off for {}s",
+                "rate-limited by anthropic (consecutive={}); backing off for {}s ({})",
                 consecutive_429s + 1,
-                dur.as_secs()
+                dur.as_secs(),
+                source,
             ));
             consecutive_429s = consecutive_429s.saturating_add(1);
             dur
@@ -903,6 +933,20 @@ fn poll_loop(
 /// Heuristic: an HTTP 429 from any of the upstream calls.
 fn is_rate_limit_error(err: &str) -> bool {
     err.contains("429") || err.to_lowercase().contains("too many requests")
+}
+
+/// Extract the Retry-After value (seconds) embedded by `oauth::get_json` in
+/// 429 error messages. The format we emit is `... (retry-after=NNNNs): ...`.
+/// We pull it back out via a tiny string match rather than threading a
+/// structured error type all the way up; the rest of the codebase already
+/// treats fetch errors as `String`, so keeping that contract is cheaper than
+/// reshaping the type for one signal.
+fn parse_retry_after_seconds(err: &str) -> Option<u64> {
+    let marker = "retry-after=";
+    let start = err.find(marker)? + marker.len();
+    let tail = &err[start..];
+    let end = tail.find(|c: char| !c.is_ascii_digit())?;
+    tail[..end].parse::<u64>().ok()
 }
 
 /// Play `Sosumi` ALARM_REPEATS times on a background thread so we don't block
