@@ -319,6 +319,20 @@ fn main() -> Result<()> {
     let mut last_snaps: Option<Vec<UsageSnapshot>> = if persisted.is_empty() {
         None
     } else {
+        // If the persisted snapshot is already over threshold, light the
+        // visual alarm immediately so a restart while in the danger zone
+        // doesn't leave the user without the warning until the next fetch.
+        // The audio alarm intentionally does NOT fire here — it's a "once
+        // per window" surface and we don't want app restarts to spam the
+        // user with Sosumi.
+        if config.alarm_enabled {
+            if let Some((util, _)) = max_five_hour_utilization(&persisted) {
+                if util >= alarm_threshold() {
+                    blink.active = true;
+                    blink.red_phase = true;
+                }
+            }
+        }
         if let Some(tray) = tray_icon.as_ref() {
             current_ids = render_menu_only(
                 tray,
