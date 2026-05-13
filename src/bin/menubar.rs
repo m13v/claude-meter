@@ -124,13 +124,13 @@ const RATE_LIMIT_BACKOFF_LADDER: &[Duration] = &[
     Duration::from_secs(300),
 ];
 
-/// Upper bound on how long we'll honor a server-supplied `Retry-After`. The
-/// real Anthropic values we've observed are ~22 minutes; clamping at 30
-/// keeps a runaway header (or misconfigured proxy) from parking us for an
-/// hour. Lower bound is 30s — anything shorter is noise we'd rather absorb
-/// into the next natural poll.
+/// Lower bound on a server-supplied `Retry-After`. Anything shorter is
+/// noise we'd rather absorb into the next natural poll. There is no upper
+/// bound — if Anthropic says wait an hour, we wait an hour. Clamping below
+/// the requested value just guarantees an extra 429 (which is worse than
+/// the silence we'd be trying to avoid). The user can quit the app
+/// manually if a header value ever goes pathological.
 const RETRY_AFTER_MIN: Duration = Duration::from_secs(30);
-const RETRY_AFTER_MAX: Duration = Duration::from_secs(30 * 60);
 
 /// Utilization (%) on the 5-hour rolling window at which the alarm fires.
 const ALARM_THRESHOLD_DEFAULT: f64 = 95.0;
@@ -876,7 +876,7 @@ fn poll_loop(
         };
         let retry_after_hint: Option<Duration> = match &result {
             Err(e) => parse_retry_after_seconds(e)
-                .map(|secs| Duration::from_secs(secs).clamp(RETRY_AFTER_MIN, RETRY_AFTER_MAX)),
+                .map(|secs| Duration::from_secs(secs).max(RETRY_AFTER_MIN)),
             Ok(_) => None,
         };
         let _ = proxy.send_event(AppEvent::Snapshots(result));
