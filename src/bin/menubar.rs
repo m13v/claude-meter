@@ -375,31 +375,51 @@ fn main() -> Result<()> {
                 // identifier — when it changes, we're in a new window and
                 // re-arm. Manual mute via the toggle short-circuits firing
                 // but doesn't affect arming.
+                //
+                // Visual alarm (blinking title) tracks the same threshold but
+                // has a separate lifecycle: it stays active for as long as
+                // utilization is at/over 95% AND the user hasn't dismissed it
+                // for the current window. The audio fires once; the visual
+                // keeps signaling until the user acknowledges.
+                let was_blink_active = blink.active;
                 if let Some((util, resets_at)) = max_five_hour_utilization(&merged) {
                     let already_fired_this_window = match (last_alarm_window, resets_at) {
                         (Some(prev), Some(curr)) => prev == curr,
                         _ => false,
                     };
-                    if !already_fired_this_window
-                        && util >= ALARM_THRESHOLD
-                        && config.alarm_enabled
-                    {
-                        log_capture(
-                            "warn",
-                            &format!(
-                                "alarm: 5h utilization {:.1}% >= {:.0}% — firing",
-                                util, ALARM_THRESHOLD
-                            ),
-                        );
-                        play_alarm_sound();
-                        post_alarm_notification(util);
-                        last_alarm_window = resets_at.or(Some(chrono::Utc::now()));
-                    } else if let Some(prev) = last_alarm_window {
-                        // Window rolled over → clear so the next high reading
-                        // can fire.
+
+                    // Detect window rollover and reset both the audio re-arm
+                    // and the visual-dismiss latch. We do this independently
+                    // of the firing branch so a rollover at <95% still clears
+                    // the latch for the next high reading.
+                    if let Some(prev) = last_alarm_window {
                         if resets_at.map(|c| c != prev).unwrap_or(false) {
                             last_alarm_window = None;
+                            blink_dismissed = false;
                         }
+                    }
+
+                    if util >= ALARM_THRESHOLD && config.alarm_enabled {
+                        if !already_fired_this_window {
+                            log_capture(
+                                "warn",
+                                &format!(
+                                    "alarm: 5h utilization {:.1}% >= {:.0}% — firing",
+                                    util, ALARM_THRESHOLD
+                                ),
+                            );
+                            play_alarm_sound();
+                            post_alarm_notification(util);
+                            last_alarm_window = resets_at.or(Some(chrono::Utc::now()));
+                        }
+                        // Visual stays on until dismissed or util drops.
+                        blink.active = !blink_dismissed;
+                    } else {
+                        // Below threshold (or alarm disabled): stop blinking
+                        // and re-arm the dismiss latch so a future re-cross
+                        // gets the visual back.
+                        blink.active = false;
+                        blink_dismissed = false;
                     }
                 }
 
@@ -412,10 +432,13 @@ fn main() -> Result<()> {
                     .map(|old| account_set_changed(old, &merged))
                     .unwrap_or(true);
                 last_snaps = Some(merged);
-                // Only rebuild the menu when the account set itself changed (new
-                // email, or stale↔fresh flip). Mid-flight percentage updates
-                // reach the user on their next click via title + re-render.
-                if accounts_changed {
+                // Rebuild the menu on account-set changes OR when the visual
+                // alarm flipped on/off, so the "Dismiss alarm" item appears
+                // and disappears in lockstep with the blink. Mid-flight
+                // percentage changes alone still skip the rebuild (we don't
+                // want to dismiss an open dropdown for a tick of usage).
+                let blink_visibility_changed = was_blink_active != blink.active;
+                if accounts_changed || blink_visibility_changed {
                     if let (Some(tray), Some(s)) = (tray_icon.as_ref(), last_snaps.as_deref()) {
                         current_ids = render_menu_only(
                             tray,
@@ -423,10 +446,11 @@ fn main() -> Result<()> {
                             last_fetched,
                             config.title_format,
                             config.alarm_enabled,
+                            blink.active,
                         );
                     }
                 }
-                if numbers_changed || error_cleared {
+                if numbers_changed || error_cleared || blink_visibility_changed {
                     dirty = true;
                 }
             }
@@ -445,6 +469,25 @@ fn main() -> Result<()> {
                     current_ids = new_ids;
                 }
                 dirty = true;
+            }
+            Event::UserEvent(AppEvent::BlinkTick) => {
+                // Toggle the blink phase and repaint, but only while the
+                // visual alarm is active. We bypass the `dirty` flag and
+                // paint directly so the cadence stays even — the dirty path
+                // is gated on data changes which we don't have here.
+                if blink.active {
+                    blink.red_phase = !blink.red_phase;
+                    if let Some(tray) = tray_icon.as_ref() {
+                        apply_title(
+                            tray,
+                            last_snaps.as_deref(),
+                            last_error.as_deref(),
+                            config.title_format,
+                            config.preferred_browser.as_deref(),
+                            blink,
+                        );
+                    }
+                }
             }
             _ => {}
         }
@@ -472,6 +515,7 @@ fn main() -> Result<()> {
                             last_fetched,
                             config.title_format,
                             config.alarm_enabled,
+                            blink.active,
                         );
                     }
                     dirty = true;
@@ -481,6 +525,14 @@ fn main() -> Result<()> {
             if current_ids.alarm_toggle.as_ref() == Some(&menu_event.id) {
                 config.alarm_enabled = !config.alarm_enabled;
                 save_config(&config);
+                // Disabling the sound also kills any visible blink — the
+                // toggle is the user's holistic "alarm" preference. The
+                // blink will re-arm on the next snapshot if the toggle goes
+                // back on while utilization is still high.
+                if !config.alarm_enabled && blink.active {
+                    blink.active = false;
+                    dirty = true;
+                }
                 if let (Some(tray), Some(snaps)) =
                     (tray_icon.as_ref(), last_snaps.as_deref())
                 {
@@ -490,12 +542,38 @@ fn main() -> Result<()> {
                         last_fetched,
                         config.title_format,
                         config.alarm_enabled,
+                        blink.active,
                     );
                 }
                 continue;
             }
             if current_ids.alarm_test.as_ref() == Some(&menu_event.id) {
                 play_alarm_sound();
+                continue;
+            }
+            if current_ids.dismiss_alarm.as_ref() == Some(&menu_event.id) {
+                // Latch the dismiss for the current 5-hour window and stop
+                // the blink immediately. The latch clears on window rollover
+                // or when utilization drops back below threshold (handled in
+                // the snapshot branch), so the user doesn't have to remember
+                // to "re-arm" anything.
+                log_info("alarm dismissed by user — silencing blink for current window");
+                blink_dismissed = true;
+                blink.active = false;
+                blink.red_phase = false;
+                if let (Some(tray), Some(snaps)) =
+                    (tray_icon.as_ref(), last_snaps.as_deref())
+                {
+                    current_ids = render_menu_only(
+                        tray,
+                        snaps,
+                        last_fetched,
+                        config.title_format,
+                        config.alarm_enabled,
+                        blink.active,
+                    );
+                }
+                dirty = true;
                 continue;
             }
             if let Some(url) = current_ids.open_urls.get(&menu_event.id) {
@@ -513,6 +591,7 @@ fn main() -> Result<()> {
                             last_fetched,
                             config.title_format,
                             config.alarm_enabled,
+                            blink.active,
                         );
                     }
                     dirty = true;
@@ -529,6 +608,7 @@ fn main() -> Result<()> {
                     last_error.as_deref(),
                     config.title_format,
                     config.preferred_browser.as_deref(),
+                    blink,
                 );
             }
         }
