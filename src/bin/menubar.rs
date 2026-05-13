@@ -316,23 +316,14 @@ fn main() -> Result<()> {
     let mut blink = BlinkState::OFF;
     let mut blink_dismissed = false;
     let persisted = load_snapshots();
+    // Persisted snapshots are loaded as "last available" but never trigger the
+    // blink on their own. The visual alarm only fires from a FRESH snapshot
+    // (Snapshots(Ok) branch). If we're in a 429 window at startup, the user
+    // just sees the last known percentages with a "!" marker — no blinking
+    // off stale data, no spam from app restarts.
     let mut last_snaps: Option<Vec<UsageSnapshot>> = if persisted.is_empty() {
         None
     } else {
-        // If the persisted snapshot is already over threshold, light the
-        // visual alarm immediately so a restart while in the danger zone
-        // doesn't leave the user without the warning until the next fetch.
-        // The audio alarm intentionally does NOT fire here — it's a "once
-        // per window" surface and we don't want app restarts to spam the
-        // user with Sosumi.
-        if config.alarm_enabled {
-            if let Some((util, _)) = max_five_hour_utilization(&persisted) {
-                if util >= alarm_threshold() {
-                    blink.active = true;
-                    blink.red_phase = true;
-                }
-            }
-        }
         if let Some(tray) = tray_icon.as_ref() {
             current_ids = render_menu_only(
                 tray,
