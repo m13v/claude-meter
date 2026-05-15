@@ -242,6 +242,8 @@ fn main() -> Result<()> {
                 ),
                 attach_stacktrace: true,
                 send_default_pii: false,
+                auto_session_tracking: true,
+                session_mode: sentry::SessionMode::Application,
                 ..Default::default()
             },
         )))
