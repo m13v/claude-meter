@@ -103,6 +103,17 @@ fn log_capture(level: &str, msg: &str) {
 const POLL_MIN: Duration = Duration::from_secs(90);
 const POLL_BASE: Duration = Duration::from_secs(180);
 const POLL_MAX: Duration = Duration::from_secs(600);
+/// External "the keychain blob just changed, re-fetch now" sentinel.
+/// An external tool (e.g. `claude-acct` from ~/claude-account-rotator) touches
+/// `~/.config/ClaudeMeter/refresh_now` after rotating the `Claude Code-credentials`
+/// keychain entry. The watcher thread polls that file's mtime at
+/// `ACCOUNT_SWITCH_POLL` cadence and pokes the same `refresh_tx` channel the
+/// "Refresh now" menu item uses, so the menu bar shows the new account's
+/// numbers within ~1–2s of the swap instead of waiting for the next scheduled
+/// poll (which can be up to 600s away on the idle cadence, or longer if we're
+/// inside a 429 backoff window from the previous account).
+const ACCOUNT_SWITCH_SENTINEL_FILENAME: &str = "refresh_now";
+const ACCOUNT_SWITCH_POLL: Duration = Duration::from_millis(1500);
 /// Utilization (%) at or above which we switch to the fast cadence. Sits below
 /// the alarm threshold so the user gets multiple ticks of warning before fire.
 const HIGH_UTIL_FAST_POLL: f64 = 80.0;
@@ -281,6 +292,18 @@ fn main() -> Result<()> {
     let proxy = event_loop.create_proxy();
     let blink_proxy = event_loop.create_proxy();
     let (refresh_tx, refresh_rx) = mpsc::channel::<()>();
+
+    // External-rotator integration: an outside tool (claude-acct, etc.) can
+    // touch `~/.config/ClaudeMeter/refresh_now` after swapping the Claude
+    // Code OAuth blob in the keychain. The watcher thread converts that
+    // mtime change into a poke on `refresh_tx`, identical to clicking the
+    // "Refresh now" menu item. Without this, the menu bar would keep showing
+    // the OLD account's usage numbers for up to ~10 minutes (idle cadence)
+    // or for the remainder of any active 429 backoff.
+    {
+        let watcher_tx = refresh_tx.clone();
+        std::thread::spawn(move || account_switch_watcher_loop(watcher_tx));
+    }
 
     // Bridge listener (port 63762) was the legacy cookie-source path that
     // accepted POSTs from the browser extension. Now that fetch_all is
@@ -825,6 +848,68 @@ fn smart_interval(
         3 => Duration::from_secs(320),
         4 => Duration::from_secs(420),
         _ => POLL_MAX,
+    }
+}
+
+/// Background thread that watches the account-switch sentinel file
+/// (`~/.config/ClaudeMeter/refresh_now`) for mtime changes. When the sentinel
+/// is touched (by `claude-acct use`/`next` or any other external rotator), we
+/// poke the shared refresh channel so `poll_loop` wakes immediately and
+/// re-fetches against the new keychain blob.
+///
+/// Implementation note: we deliberately do NOT use FSEvents / kqueue here.
+/// (1) Tray-icon apps under Tao don't have a convenient run-loop-attached
+/// FSEvents path without pulling in another crate. (2) A 1.5s poll on a single
+/// file's metadata is effectively free (one stat syscall, no I/O). (3) Polling
+/// keeps the watcher self-contained — no permissions, no extra crates, no
+/// FFI surface, no breakage when `~/.config` lives on a network mount.
+///
+/// The watcher only sends; it never reads the file's contents (the sentinel
+/// is mtime-only, payload is irrelevant). It also remembers the initial mtime
+/// on startup so a sentinel that already exists (left over from a previous
+/// session) does NOT trigger a refresh until the next external touch.
+fn account_switch_watcher_loop(refresh_tx: mpsc::Sender<()>) {
+    let path = match dirs::config_dir() {
+        Some(p) => p.join("ClaudeMeter").join(ACCOUNT_SWITCH_SENTINEL_FILENAME),
+        None => {
+            log_warn("account-switch watcher: no config dir; watcher disabled");
+            return;
+        }
+    };
+    log_info(&format!(
+        "account-switch watcher: watching {} (poll={}ms)",
+        path.display(),
+        ACCOUNT_SWITCH_POLL.as_millis()
+    ));
+    let mut last_mtime: Option<std::time::SystemTime> = std::fs::metadata(&path)
+        .and_then(|m| m.modified())
+        .ok();
+    loop {
+        std::thread::sleep(ACCOUNT_SWITCH_POLL);
+        let current = std::fs::metadata(&path)
+            .and_then(|m| m.modified())
+            .ok();
+        match (current, last_mtime) {
+            (Some(curr), Some(prev)) if curr != prev => {
+                log_info("account-switch sentinel changed; triggering refresh");
+                if refresh_tx.send(()).is_err() {
+                    // Receiver dropped (app exiting). Exit the thread cleanly.
+                    return;
+                }
+                last_mtime = Some(curr);
+            }
+            (Some(curr), None) => {
+                // Sentinel appeared after we started without one. Treat it as
+                // a switch — the external rotator just ran for the first time
+                // since we booted.
+                log_info("account-switch sentinel appeared; triggering refresh");
+                if refresh_tx.send(()).is_err() {
+                    return;
+                }
+                last_mtime = Some(curr);
+            }
+            _ => {}
+        }
     }
 }
 
