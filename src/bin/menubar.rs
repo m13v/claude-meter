@@ -29,6 +29,61 @@ fn log_dir() -> Option<PathBuf> {
     dirs::home_dir().map(|p| p.join("Library").join("Logs").join("ClaudeMeter"))
 }
 
+/// Persistent anonymous install ID for Sentry user attribution.
+///
+/// Hostname (`tags[server_name]`) is unreliable as a user proxy because macOS
+/// defaults like `MacBook-Air.local`, `Mac.lan`, and `MacBook-Pro.local` collide
+/// across different machines, so distinct users get merged into a single bucket
+/// in Sentry. The fix is to give Sentry a stable per-install identifier that
+/// has nothing to do with the hostname.
+///
+/// First call: generate a v4 UUID from `/dev/urandom` and persist it to
+/// `~/Library/Application Support/claude-meter/install_id`. Subsequent calls
+/// (including across app restarts and version upgrades) read the existing
+/// value. If the user wipes Application Support or reinstalls fresh, they
+/// look like a new user — that's the intended semantics of "install ID."
+///
+/// Returns `None` only if both the file read and the urandom write fail
+/// (extremely unlikely on macOS); callers gracefully skip setting the user
+/// in that case and fall back to hostname.
+fn get_or_create_install_id() -> Option<String> {
+    let dir = dirs::home_dir()?
+        .join("Library")
+        .join("Application Support")
+        .join("claude-meter");
+    std::fs::create_dir_all(&dir).ok()?;
+    let path = dir.join("install_id");
+
+    if let Ok(existing) = std::fs::read_to_string(&path) {
+        let trimmed = existing.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+
+    // Generate a v4 UUID from /dev/urandom (macOS-only project, always present).
+    let mut bytes = [0u8; 16];
+    use std::io::Read;
+    let mut f = std::fs::File::open("/dev/urandom").ok()?;
+    f.read_exact(&mut bytes).ok()?;
+    // RFC 4122: set version (4) in the high nibble of byte 6 and variant (10xx)
+    // in the high bits of byte 8. Without these bits Sentry still accepts the
+    // string, but downstream UUID validators (e.g. anything that re-parses the
+    // user.id) would reject it.
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    let id = format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        bytes[0], bytes[1], bytes[2], bytes[3],
+        bytes[4], bytes[5],
+        bytes[6], bytes[7],
+        bytes[8], bytes[9],
+        bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15],
+    );
+    std::fs::write(&path, &id).ok()?;
+    Some(id)
+}
+
 fn open_log_file() -> Option<std::fs::File> {
     let dir = log_dir()?;
     std::fs::create_dir_all(&dir).ok()?;
@@ -279,6 +334,23 @@ fn main() -> Result<()> {
     } else {
         None
     };
+    // Stable anonymous install ID so Sentry can distinguish users without
+    // relying on hostname (which collides on macOS defaults like
+    // `MacBook-Air.local`). See `get_or_create_install_id` for the storage
+    // contract. Set before the heartbeat so the very first event already
+    // carries `user.id`, which means historical analytics start working
+    // immediately rather than after the next captured event.
+    if _sentry_guard.is_some() {
+        if let Some(install_id) = get_or_create_install_id() {
+            sentry::configure_scope(|scope| {
+                scope.set_user(Some(sentry::User {
+                    id: Some(install_id),
+                    ..Default::default()
+                }));
+            });
+        }
+    }
+
     // Heartbeat: capture a real Sentry event on every launch so we can confirm
     // the SDK in the installed binary is reaching Sentry. Cheap (one event per
     // process start, not per poll) and gives an unambiguous "is the wiring
