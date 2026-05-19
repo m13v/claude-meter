@@ -118,21 +118,39 @@ const ACCOUNT_SWITCH_POLL: Duration = Duration::from_millis(1500);
 /// the alarm threshold so the user gets multiple ticks of warning before fire.
 const HIGH_UTIL_FAST_POLL: f64 = 80.0;
 
-/// Backoff schedule after Anthropic returns 429 *without* a `Retry-After`
-/// header. The first 429 is often a per-minute bucket transient and clears
-/// in 60-90s, so a long wait is overkill and leaves the menu bar showing
-/// the error too long. Repeated 429s suggest the per-hour or per-day limit,
-/// where we want to back off more aggressively. Index = number of
-/// *consecutive* 429s already seen (saturating; the last entry repeats).
+/// Backoff schedule for 429s, indexed by number of *consecutive* failures
+/// (saturating: index >= length clamps to the last entry).
 ///
-/// When the server DOES send `Retry-After`, we honor it (clamped) and the
-/// ladder is bypassed entirely. Anthropic's `/api/oauth/usage` consistently
-/// returns Retry-After in seconds when the soft cap is hit; ignoring it and
-/// knocking every 5min just re-extends the window.
+/// SEMANTICS CHANGED 2026-05-19: the ladder is now a FLOOR. The actual wait
+/// is `max(server_retry_after, ladder[consecutive])`, not "server hint wins
+/// if present" as it was before. Reason: Anthropic's `/api/oauth/usage` was
+/// observed sending `Retry-After: 0` alongside HTTP 429 for 8 days straight
+/// (2026-05-11 to 2026-05-19, 5,870 events). The old code happily clamped
+/// `0s` up to `RETRY_AFTER_MIN` (30s), waited 30s, retried, got the same
+/// `Retry-After: 0` 429, and looped forever — never escalating, never
+/// reaching the ladder. That hammered the per-IP OAuth bucket continuously
+/// and starved every other client on the machine (including the
+/// `claude-account-rotator` token-refresh path).
+///
+/// With the ladder as a floor, sustained failures escalate the backoff
+/// regardless of what the server says. A garbage `Retry-After: 0` can no
+/// longer keep us in a hot loop. A legitimately long `Retry-After: 3600`
+/// still wins (we trust the server when it's longer than our floor).
+///
+/// Ladder values:
+///   0    75s    first 429, usually a per-minute bucket — clears fast
+///   1    180s   second 429, probably hour bucket
+///   2    300s   = 5min
+///   3    600s   = 10min, persistent problem
+///   4    1200s  = 20min
+///   5+   1800s  = 30min cap (sustained outage; bucket fully refills)
 const RATE_LIMIT_BACKOFF_LADDER: &[Duration] = &[
     Duration::from_secs(75),
     Duration::from_secs(180),
     Duration::from_secs(300),
+    Duration::from_secs(600),
+    Duration::from_secs(1200),
+    Duration::from_secs(1800),
 ];
 
 /// Lower bound on a server-supplied `Retry-After`. Anything shorter is
@@ -988,18 +1006,33 @@ fn poll_loop(
         let _ = proxy.send_event(AppEvent::Snapshots(result));
 
         let wait = if rate_limited {
-            // Prefer the server-supplied Retry-After when present. The
-            // hardcoded ladder is only a fallback for 429s that don't carry
-            // a header — Anthropic's `/api/oauth/usage` does carry one, and
-            // ignoring it was burning attempts every 5min during a ~22min
-            // window, which probably re-extended that window each cycle.
-            let server_hint = retry_after_hint;
-            let (dur, source) = match server_hint {
-                Some(d) => (d, "server retry-after"),
-                None => {
-                    let idx = consecutive_429s.min(RATE_LIMIT_BACKOFF_LADDER.len() - 1);
-                    (RATE_LIMIT_BACKOFF_LADDER[idx], "ladder")
+            // Backoff is `max(server_retry_after, ladder[consecutive_429s])`.
+            // The ladder is the FLOOR. See the RATE_LIMIT_BACKOFF_LADDER
+            // doc comment for why this is no longer "server hint wins" —
+            // tl;dr: Anthropic was sending Retry-After: 0 with every 429
+            // and the old code looped on 30s waits forever (5,870 events
+            // in 8 days), starving the per-IP OAuth bucket for everyone
+            // else on the machine.
+            let idx = consecutive_429s.min(RATE_LIMIT_BACKOFF_LADDER.len() - 1);
+            let ladder_wait = RATE_LIMIT_BACKOFF_LADDER[idx];
+            let (dur, source) = match retry_after_hint {
+                Some(server_d) if server_d > ladder_wait => {
+                    // Server says wait longer than our floor — honor it.
+                    // Anthropic's hard rate-limit response uses this path
+                    // for explicit hour+ lockouts.
+                    (server_d, "server retry-after (above ladder floor)")
                 }
+                Some(server_d) => {
+                    // Server hint is shorter than the floor. Either a
+                    // bogus Retry-After: 0 (the 8-day storm) or just an
+                    // optimistic short value. Use the floor instead.
+                    log_info(&format!(
+                        "ignoring short server retry-after ({}s) in favor of ladder floor",
+                        server_d.as_secs()
+                    ));
+                    (ladder_wait, "ladder (server retry-after too short)")
+                }
+                None => (ladder_wait, "ladder"),
             };
             log_warn(&format!(
                 "rate-limited by anthropic (consecutive={}); backing off for {}s ({})",
