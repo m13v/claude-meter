@@ -22,8 +22,15 @@ const SENTRY_DSN: &str = "https://2a67e355b17fd4e2da6cc2e135f765f8@o450761716131
 
 /// Log file path under ~/Library/Logs/ClaudeMeter/menubar.log. Lazily opened
 /// the first time `log_line` runs; appended to until the process exits. No
-/// rotation — desktop app, low write volume, user can `truncate` if it grows.
+/// rotation, desktop app, low write volume, user can `truncate` if it grows.
 static LOG_FILE: Mutex<Option<std::fs::File>> = Mutex::new(None);
+
+/// Last rendered title text. Used by `apply_title` to dedupe the
+/// `title-paint` log line so we only emit when the visible text actually
+/// changes (blink phase changes bg only, never text, so this stays quiet
+/// during steady state and fires once when the bar transitions between
+/// "5h X% / 7d Y%", "—", "Claude: …", "Claude: !", etc.).
+static LAST_TITLE_TEXT: Mutex<Option<String>> = Mutex::new(None);
 
 fn log_dir() -> Option<PathBuf> {
     dirs::home_dir().map(|p| p.join("Library").join("Logs").join("ClaudeMeter"))
@@ -837,6 +844,10 @@ fn apply_title(
         }
     }
 
+    // Build the rendered text once so we can both log it and pass it to the
+    // fallback path. Lets us trace exactly what the user sees in the bar.
+    let rendered_text: String = segs.iter().map(|s| s.text.as_str()).collect();
+
     #[cfg(target_os = "macos")]
     let applied = {
         let m: Vec<macos_title::Segment> = segs
@@ -852,8 +863,45 @@ fn apply_title(
     let applied = false;
 
     if !applied {
-        let text: String = segs.iter().map(|s| s.text.as_str()).collect();
-        let _ = tray.set_title(Some(&text));
+        let _ = tray.set_title(Some(&rendered_text));
+    }
+
+    // Log title transitions. Deduped so a steady-state poll loop stays quiet;
+    // fires when text flips between numbers / "—" / "Claude: …" / "Claude: !"
+    // / number-with-" !" suffix. Includes snap and error counts so we can
+    // correlate a "—" or "?" appearance with the data we had at paint time.
+    let (snap_total, snap_stale) = match snaps {
+        Some(s) => (s.len(), s.iter().filter(|x| x.stale).count()),
+        None => (0, 0),
+    };
+    let err_present = error.is_some();
+    let blink_active = blink.active;
+    let path = if !applied { "fallback-tray" } else { "native-macos" };
+    if let Ok(mut guard) = LAST_TITLE_TEXT.lock() {
+        let changed = match guard.as_ref() {
+            Some(prev) => prev != &rendered_text,
+            None => true,
+        };
+        if changed {
+            let prev_display = guard
+                .as_deref()
+                .map(|s| format!("\"{}\"", s))
+                .unwrap_or_else(|| "<none>".to_string());
+            log_line(
+                "info",
+                &format!(
+                    "title-paint: \"{}\" (prev={}, snaps={} stale={} err={} blink={} path={})",
+                    rendered_text,
+                    prev_display,
+                    snap_total,
+                    snap_stale,
+                    err_present,
+                    blink_active,
+                    path,
+                ),
+            );
+            *guard = Some(rendered_text);
+        }
     }
 }
 
@@ -1759,11 +1807,28 @@ fn bg_for(util: f64) -> Option<(u8, u8, u8)> {
 }
 
 fn account_tag(s: &UsageSnapshot) -> String {
-    s.account_email
+    match s
+        .account_email
         .as_deref()
         .and_then(|e| e.chars().next())
         .map(|c| c.to_ascii_uppercase().to_string())
-        .unwrap_or_else(|| "?".to_string())
+    {
+        Some(t) => t,
+        None => {
+            // This is the only code path that puts a literal "?" in the
+            // menubar title. If the user reports a "?" tag, this log line
+            // is the smoking gun: it tells us which browser + stale state
+            // produced a snapshot with a missing account_email.
+            log_line(
+                "warn",
+                &format!(
+                    "account_tag: fallback to \"?\" (browser={} stale={} fetched_at={})",
+                    s.browser, s.stale, s.fetched_at
+                ),
+            );
+            "?".to_string()
+        }
+    }
 }
 
 fn title_segments(
