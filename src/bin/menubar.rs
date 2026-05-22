@@ -1958,19 +1958,51 @@ fn reset_suffix(at: Option<DateTime<chrono::Utc>>) -> String {
     match at {
         Some(t) => {
             let delta = t.signed_duration_since(chrono::Utc::now());
+            let total_secs = delta.num_seconds();
+            if total_secs <= 0 {
+                return " · resets soon".to_string();
+            }
+
             let days = delta.num_days();
-            let hrs = delta.num_hours() - days * 24;
-            let mut parts = Vec::new();
-            if days > 0 {
-                parts.push(format!("{days}d"));
-            }
-            if hrs > 0 {
-                parts.push(format!("{hrs}h"));
-            }
-            if parts.is_empty() {
-                " · resets soon".to_string()
+            let total_hours = delta.num_hours();
+            let hrs_in_day = total_hours - days * 24;
+            let mins_in_hour = delta.num_minutes() - total_hours * 60;
+
+            // Pick a granularity that's useful for the time scale:
+            //   >= 1 day  -> "Xd Yh" (plus absolute date so user knows WHICH day)
+            //   >= 2h     -> "Xh"
+            //   >= 1h     -> "Xh Ym"
+            //   < 1h      -> "Ym"
+            let duration = if days > 0 {
+                if hrs_in_day > 0 {
+                    format!("{days}d {hrs_in_day}h")
+                } else {
+                    format!("{days}d")
+                }
+            } else if total_hours >= 2 {
+                format!("{total_hours}h")
+            } else if total_hours >= 1 {
+                if mins_in_hour > 0 {
+                    format!("{total_hours}h {mins_in_hour}m")
+                } else {
+                    format!("{total_hours}h")
+                }
             } else {
-                format!(" · resets in {}", parts.join(" "))
+                let mins = delta.num_minutes().max(1);
+                format!("{mins}m")
+            };
+
+            if days > 0 {
+                // For multi-day windows, also show the actual local reset date
+                // so the user knows it's, e.g., next Monday vs. today + 6h.
+                let local: DateTime<Local> = t.into();
+                format!(
+                    " · resets in {} ({})",
+                    duration,
+                    local.format("%a %b %-d %H:%M")
+                )
+            } else {
+                format!(" · resets in {}", duration)
             }
         }
         None => String::new(),
