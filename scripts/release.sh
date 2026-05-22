@@ -25,16 +25,40 @@ DMG_PATH="$OUT_DIR/$APP_NAME-$VERSION.dmg"
 ZIP_PATH="$OUT_DIR/$APP_NAME-$VERSION.zip"
 ENTITLEMENTS="scripts/entitlements.plist"
 
-echo "[1/9] building release binaries..."
+echo "[1/9] building universal release binaries (arm64 + x86_64)..."
 bash scripts/build-icons.sh
-cargo build --release --bin claude-meter --bin claude-meter-menubar
+# Cross-compile for both Mac architectures. Pinning MACOSX_DEPLOYMENT_TARGET=11.0
+# matches LSMinimumSystemVersion below; without this the x86_64 slice inherits
+# the host SDK's min OS and may reject older Intel Macs.
+export MACOSX_DEPLOYMENT_TARGET=11.0
+rustup target add aarch64-apple-darwin x86_64-apple-darwin >/dev/null
+cargo build --release --target aarch64-apple-darwin --bin claude-meter --bin claude-meter-menubar
+cargo build --release --target x86_64-apple-darwin  --bin claude-meter --bin claude-meter-menubar
+UNIVERSAL_DIR="target/universal-release"
+mkdir -p "$UNIVERSAL_DIR"
+lipo -create \
+    "target/aarch64-apple-darwin/release/claude-meter" \
+    "target/x86_64-apple-darwin/release/claude-meter" \
+    -output "$UNIVERSAL_DIR/claude-meter"
+lipo -create \
+    "target/aarch64-apple-darwin/release/claude-meter-menubar" \
+    "target/x86_64-apple-darwin/release/claude-meter-menubar" \
+    -output "$UNIVERSAL_DIR/claude-meter-menubar"
+# Sanity-check the universal slice; abort if either arch is missing.
+for bin in claude-meter claude-meter-menubar; do
+    if ! file "$UNIVERSAL_DIR/$bin" | grep -q "2 architectures.*x86_64.*arm64\|2 architectures.*arm64.*x86_64"; then
+        echo "ERROR: $bin is not a universal binary:" >&2
+        file "$UNIVERSAL_DIR/$bin" >&2
+        exit 1
+    fi
+done
 
 echo "[2/9] assembling $APP_BUNDLE..."
 rm -rf "$APP_BUNDLE"
 mkdir -p "$APP_BUNDLE/Contents/MacOS"
 mkdir -p "$APP_BUNDLE/Contents/Resources"
-cp "target/release/claude-meter-menubar" "$APP_BUNDLE/Contents/MacOS/$APP_NAME"
-cp "target/release/claude-meter" "$APP_BUNDLE/Contents/MacOS/claude-meter"
+cp "$UNIVERSAL_DIR/claude-meter-menubar" "$APP_BUNDLE/Contents/MacOS/$APP_NAME"
+cp "$UNIVERSAL_DIR/claude-meter" "$APP_BUNDLE/Contents/MacOS/claude-meter"
 cp "assets/AppIcon.icns" "$APP_BUNDLE/Contents/Resources/AppIcon.icns"
 
 cat > "$APP_BUNDLE/Contents/Info.plist" <<PLIST
