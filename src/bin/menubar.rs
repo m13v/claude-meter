@@ -2211,3 +2211,51 @@ mod macos_title {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::reset_suffix;
+    use chrono::{Duration, Utc};
+
+    #[test]
+    fn reset_suffix_buckets() {
+        // Each target uses a generous extra minute so that the test stays
+        // deterministic against the tiny gap between `Utc::now()` here and the
+        // call inside `reset_suffix` (where everything is floored to integer
+        // hours/days).
+        let buf = Duration::minutes(1);
+        let now = Utc::now();
+
+        // multi-day: includes Xd Yh and an absolute date in parens
+        let s = reset_suffix(Some(now + Duration::days(5) + Duration::hours(3) + buf));
+        assert!(s.starts_with(" · resets in 5d 3h ("), "got {s:?}");
+        assert!(s.ends_with(")"), "got {s:?}");
+
+        // 23h: hours only, no date
+        let s = reset_suffix(Some(now + Duration::hours(23) + Duration::minutes(5)));
+        assert_eq!(s, " · resets in 23h");
+
+        // 2h: hours only
+        let s = reset_suffix(Some(now + Duration::hours(2) + buf));
+        assert_eq!(s, " · resets in 2h");
+
+        // 1h 45m: hours + minutes (under 2h gets minute precision)
+        let s = reset_suffix(Some(now + Duration::hours(1) + Duration::minutes(45) + Duration::seconds(15)));
+        assert_eq!(s, " · resets in 1h 45m");
+
+        // 45m: minutes only
+        let s = reset_suffix(Some(now + Duration::minutes(45) + Duration::seconds(15)));
+        assert_eq!(s, " · resets in 45m");
+
+        // 30s: rounds up to 1m, not "soon"
+        let s = reset_suffix(Some(now + Duration::seconds(30)));
+        assert_eq!(s, " · resets in 1m");
+
+        // past: "resets soon"
+        let s = reset_suffix(Some(now - Duration::minutes(5)));
+        assert_eq!(s, " · resets soon");
+
+        // None: empty
+        assert_eq!(reset_suffix(None), "");
+    }
+}
