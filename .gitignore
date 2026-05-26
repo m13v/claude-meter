@@ -3,3 +3,6 @@
 Cargo.lock.bak
 .DS_Store
 .mcp.json
+
+# Per-project Claude runtime state
+.claude/scheduled_tasks.lock
