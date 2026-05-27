@@ -1100,21 +1100,6 @@ fn account_switch_watcher_loop(refresh_tx: mpsc::Sender<()>) {
 /// CLI rotates the token roughly every 8 hours, so the upper bound on
 /// "unnecessary" refetches is ~3/day. Acceptable.
 fn keychain_watcher_loop(refresh_tx: mpsc::Sender<()>) {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-
-    fn fingerprint(token: &str) -> String {
-        let mut h = DefaultHasher::new();
-        token.hash(&mut h);
-        format!("{:016x}", h.finish())
-    }
-
-    fn iso_expiry(ms: i64) -> String {
-        chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms)
-            .map(|d| d.to_rfc3339())
-            .unwrap_or_else(|| format!("<unparseable epoch_ms={ms}>"))
-    }
-
     log_info(&format!(
         "keychain watcher: starting (poll={}s)",
         KEYCHAIN_POLL.as_secs()
@@ -1123,17 +1108,35 @@ fn keychain_watcher_loop(refresh_tx: mpsc::Sender<()>) {
     let mut last_token: Option<String> = None;
     let mut consecutive_failures: u32 = 0;
 
-    // Initial read: baseline the current state so we don't fire a spurious
-    // refresh on startup (the existing poll_loop already does a first fetch).
+    // Initial read: compare against the fingerprint persisted alongside the
+    // last successful fetch. If they match, take it as baseline silently. If
+    // they don't (the user ran `claude login` or the rotator swapped accounts
+    // while we were down), fire a refresh immediately so the menu bar isn't
+    // stuck on the previous account's cached snapshot — this is the only
+    // path that catches cross-restart account swaps, since the runtime
+    // comparison below only sees changes that happen while the process is up.
     match oauth::read_token() {
         Ok(creds) => {
+            let curr_fp = token_fingerprint(&creds.access_token);
+            let persisted_fp = load_token_fingerprint();
             log_info(&format!(
-                "keychain watcher: initial fingerprint={} expires={} sub={} tier={}",
-                fingerprint(&creds.access_token),
-                iso_expiry(creds.expires_at),
+                "keychain watcher: initial fingerprint={curr_fp} persisted_fingerprint={} expires={} sub={} tier={}",
+                persisted_fp.as_deref().unwrap_or("<none>"),
+                iso_expiry_ms(creds.expires_at),
                 creds.subscription_type.as_deref().unwrap_or("?"),
                 creds.rate_limit_tier.as_deref().unwrap_or("?"),
             ));
+            match persisted_fp.as_deref() {
+                Some(prev) if prev != curr_fp => {
+                    log_info(&format!(
+                        "keychain changed while process was down (was={prev} now={curr_fp}); triggering refresh"
+                    ));
+                    if refresh_tx.send(()).is_err() {
+                        return;
+                    }
+                }
+                _ => {}
+            }
             last_token = Some(creds.access_token);
         }
         Err(e) => {
@@ -1161,12 +1164,12 @@ fn keychain_watcher_loop(refresh_tx: mpsc::Sender<()>) {
                 if changed {
                     let old_fp = last_token
                         .as_deref()
-                        .map(fingerprint)
+                        .map(token_fingerprint)
                         .unwrap_or_else(|| "<none>".to_string());
-                    let new_fp = fingerprint(&creds.access_token);
+                    let new_fp = token_fingerprint(&creds.access_token);
                     log_info(&format!(
                         "keychain fingerprint changed (was={old_fp} now={new_fp} expires={} sub={} tier={}); triggering refresh",
-                        iso_expiry(creds.expires_at),
+                        iso_expiry_ms(creds.expires_at),
                         creds.subscription_type.as_deref().unwrap_or("?"),
                         creds.rate_limit_tier.as_deref().unwrap_or("?"),
                     ));
