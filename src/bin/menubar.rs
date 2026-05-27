@@ -176,6 +176,16 @@ const POLL_MAX: Duration = Duration::from_secs(600);
 /// inside a 429 backoff window from the previous account).
 const ACCOUNT_SWITCH_SENTINEL_FILENAME: &str = "refresh_now";
 const ACCOUNT_SWITCH_POLL: Duration = Duration::from_millis(1500);
+
+/// Cadence at which the keychain-fingerprint watcher checks for changes to
+/// the `Claude Code-credentials` blob. Catches manual `claude login` events
+/// (and any other path that swaps the access token without touching the
+/// sentinel file). 15s is cheap (one `/usr/bin/security` subprocess per
+/// tick, ~30ms each) and well under the menu bar's idle poll cadence, so
+/// a fresh login surfaces within a few seconds rather than waiting for the
+/// next OAuth poll (which can be up to 600s away, or longer inside a 429
+/// backoff window from the previous account).
+const KEYCHAIN_POLL: Duration = Duration::from_secs(15);
 /// Utilization (%) at or above which we switch to the fast cadence. Sits below
 /// the alarm threshold so the user gets multiple ticks of warning before fire.
 const HIGH_UTIL_FAST_POLL: f64 = 80.0;
