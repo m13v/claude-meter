@@ -538,6 +538,16 @@ fn main() -> Result<()> {
                 // the next load.
                 let merged = snaps;
                 save_snapshots(&merged);
+                // Persist the fingerprint of the OAuth token that produced
+                // this snapshot, so a future startup can detect an account
+                // swap that happened while we were down. Re-reading the
+                // keychain here is cheap (one /usr/bin/security call) and
+                // tying the persisted fingerprint to a snapshot write means
+                // the file on disk always reflects "the token whose data we
+                // have cached", not "the most recent token we observed."
+                if let Ok(creds) = oauth::read_token() {
+                    save_token_fingerprint(&token_fingerprint(&creds.access_token));
+                }
 
                 // Alarm: fire once per 5-hour window when utilization first
                 // crosses the threshold. The `resets_at` of the window is the
@@ -1918,6 +1928,55 @@ fn clear_backoff() {
     if let Some(path) = backoff_path() {
         let _ = std::fs::remove_file(&path);
     }
+}
+
+/// Short, non-cryptographic fingerprint of an OAuth access token, suitable
+/// only for equality comparison and log breadcrumbs. We do NOT log the token
+/// itself; the 16-hex `DefaultHasher` output is fine because we only ever
+/// ask "did this change?" — never "what was the original?" There is no
+/// security boundary here (an attacker with the keychain blob already has
+/// the token); the hash is a privacy ergonomic, not a secret.
+fn token_fingerprint(token: &str) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    token.hash(&mut h);
+    format!("{:016x}", h.finish())
+}
+
+/// Render a millisecond epoch as a UTC ISO-8601 string for log lines. Falls
+/// back to a `<unparseable epoch_ms=…>` marker so we never silently swallow
+/// a bad timestamp (would be confusing if we later debug why an "expires"
+/// log line is missing — better to see the raw value).
+fn iso_expiry_ms(ms: i64) -> String {
+    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms)
+        .map(|d| d.to_rfc3339())
+        .unwrap_or_else(|| format!("<unparseable epoch_ms={ms}>"))
+}
+
+/// Persistent fingerprint of the OAuth access token that produced the last
+/// successful usage snapshot on disk. Used by `keychain_watcher_loop` on
+/// startup to detect "user logged into a different Claude account while
+/// claude-meter was not running" — without this, the watcher would happily
+/// adopt the new keychain as baseline and never notice the cached
+/// `snapshots.json` belongs to a different account.
+fn token_fingerprint_path() -> Option<PathBuf> {
+    dirs::config_dir().map(|p| p.join("ClaudeMeter").join("last_token_fp.txt"))
+}
+
+fn save_token_fingerprint(fp: &str) {
+    let Some(path) = token_fingerprint_path() else { return };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&path, fp);
+}
+
+fn load_token_fingerprint() -> Option<String> {
+    let path = token_fingerprint_path()?;
+    let s = std::fs::read_to_string(&path).ok()?;
+    let trimmed = s.trim();
+    if trimmed.is_empty() { None } else { Some(trimmed.to_string()) }
 }
 
 fn util_five(s: &UsageSnapshot) -> f64 {
