@@ -412,6 +412,14 @@ fn main() -> Result<()> {
         std::thread::spawn(move || account_switch_watcher_loop(watcher_tx));
     }
 
+    // Keychain-fingerprint watcher: catches `claude login` and any other path
+    // that changes the OAuth blob without touching the sentinel file. See
+    // `keychain_watcher_loop` for log policy and rationale.
+    {
+        let watcher_tx = refresh_tx.clone();
+        std::thread::spawn(move || keychain_watcher_loop(watcher_tx));
+    }
+
     // Bridge listener (port 63762) was the legacy cookie-source path that
     // accepted POSTs from the browser extension. Now that fetch_all is
     // OAuth-only and keep_active_only() drops anything tagged with a
@@ -1057,6 +1065,131 @@ fn account_switch_watcher_loop(refresh_tx: mpsc::Sender<()>) {
                 last_mtime = Some(curr);
             }
             _ => {}
+        }
+    }
+}
+
+/// Background thread that watches the `Claude Code-credentials` keychain entry
+/// for access-token changes. Complements the sentinel watcher above:
+///
+/// - Sentinel watcher fires when the *rotator* (`claude-acct`, etc.) swaps
+///   accounts, because the rotator explicitly touches `refresh_now`.
+/// - This watcher fires when *anything else* changes the keychain blob:
+///   a user typing `claude login` in a terminal, the CLI rotating its
+///   own access token on schedule (~every 8h), or any direct keychain edit.
+///   None of those touch the sentinel.
+///
+/// Compares the OAuth access token as a string. On any difference, pokes the
+/// same `refresh_tx` channel the sentinel uses, so the menu bar refetches
+/// usage against the new blob and bypasses any in-flight 429 wall-clock
+/// backoff (which was tied to the previous token's bucket and no longer
+/// applies).
+///
+/// Log policy (designed for tracing account-switch and 429 issues later):
+///   - Startup: one `info` line with the initial 16-hex fingerprint, ISO
+///     `expiresAt`, `subscriptionType`, and `rateLimitTier`. Lets us correlate
+///     against `~/claude-account-rotator/rotations.jsonl` after the fact.
+///   - On change: one `info` line with `was=` and `now=` fingerprints plus the
+///     new token's expiry and tier. Same correlation purpose.
+///   - On read failure: first failure logged at `warn` immediately, then quiet
+///     until either recovery (one `info` line with the consecutive count) or
+///     every 60th consecutive failure (= one log per 15 minutes at the
+///     default cadence). Stops a wiped keychain from spamming the log.
+///
+/// Cost of a spurious refresh on routine token rotation: one HTTP call. The
+/// CLI rotates the token roughly every 8 hours, so the upper bound on
+/// "unnecessary" refetches is ~3/day. Acceptable.
+fn keychain_watcher_loop(refresh_tx: mpsc::Sender<()>) {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    fn fingerprint(token: &str) -> String {
+        let mut h = DefaultHasher::new();
+        token.hash(&mut h);
+        format!("{:016x}", h.finish())
+    }
+
+    fn iso_expiry(ms: i64) -> String {
+        chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms)
+            .map(|d| d.to_rfc3339())
+            .unwrap_or_else(|| format!("<unparseable epoch_ms={ms}>"))
+    }
+
+    log_info(&format!(
+        "keychain watcher: starting (poll={}s)",
+        KEYCHAIN_POLL.as_secs()
+    ));
+
+    let mut last_token: Option<String> = None;
+    let mut consecutive_failures: u32 = 0;
+
+    // Initial read: baseline the current state so we don't fire a spurious
+    // refresh on startup (the existing poll_loop already does a first fetch).
+    match oauth::read_token() {
+        Ok(creds) => {
+            log_info(&format!(
+                "keychain watcher: initial fingerprint={} expires={} sub={} tier={}",
+                fingerprint(&creds.access_token),
+                iso_expiry(creds.expires_at),
+                creds.subscription_type.as_deref().unwrap_or("?"),
+                creds.rate_limit_tier.as_deref().unwrap_or("?"),
+            ));
+            last_token = Some(creds.access_token);
+        }
+        Err(e) => {
+            log_warn(&format!(
+                "keychain watcher: initial read failed: {e:#} (will keep trying every {}s)",
+                KEYCHAIN_POLL.as_secs()
+            ));
+        }
+    }
+
+    loop {
+        std::thread::sleep(KEYCHAIN_POLL);
+        match oauth::read_token() {
+            Ok(creds) => {
+                if consecutive_failures > 0 {
+                    log_info(&format!(
+                        "keychain watcher: read recovered after {consecutive_failures} consecutive failures"
+                    ));
+                    consecutive_failures = 0;
+                }
+                let changed = last_token
+                    .as_deref()
+                    .map(|prev| prev != creds.access_token.as_str())
+                    .unwrap_or(true);
+                if changed {
+                    let old_fp = last_token
+                        .as_deref()
+                        .map(fingerprint)
+                        .unwrap_or_else(|| "<none>".to_string());
+                    let new_fp = fingerprint(&creds.access_token);
+                    log_info(&format!(
+                        "keychain fingerprint changed (was={old_fp} now={new_fp} expires={} sub={} tier={}); triggering refresh",
+                        iso_expiry(creds.expires_at),
+                        creds.subscription_type.as_deref().unwrap_or("?"),
+                        creds.rate_limit_tier.as_deref().unwrap_or("?"),
+                    ));
+                    if refresh_tx.send(()).is_err() {
+                        // Receiver dropped (app exiting). Exit cleanly.
+                        return;
+                    }
+                    last_token = Some(creds.access_token);
+                }
+            }
+            Err(e) => {
+                consecutive_failures = consecutive_failures.saturating_add(1);
+                // First failure: log immediately so a `claude logout` is
+                // visible in the log. Subsequent failures: one line per 60
+                // polls (= ~15 min) so a persistently missing token doesn't
+                // flood the log. Recovery is logged separately on the success
+                // branch above.
+                if consecutive_failures == 1 || consecutive_failures % 60 == 0 {
+                    log_warn(&format!(
+                        "keychain watcher: read failed (consecutive={consecutive_failures}): {e:#}"
+                    ));
+                }
+            }
         }
     }
 }
