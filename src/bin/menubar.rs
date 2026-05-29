@@ -110,6 +110,48 @@ fn daily_active_path() -> Option<PathBuf> {
     app_support_dir().map(|p| p.join("daily_active_sent_date.txt"))
 }
 
+fn daily_active_lock_path() -> Option<PathBuf> {
+    app_support_dir().map(|p| p.join("daily_active_send.lock"))
+}
+
+struct DailyActiveLock {
+    path: PathBuf,
+}
+
+impl Drop for DailyActiveLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+fn try_acquire_daily_active_lock() -> Option<DailyActiveLock> {
+    let path = daily_active_lock_path()?;
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let stale = std::fs::metadata(&path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .map(|age| age > Duration::from_secs(5 * 60))
+        .unwrap_or(false);
+    if stale {
+        let _ = std::fs::remove_file(&path);
+    }
+    match OpenOptions::new().write(true).create_new(true).open(&path) {
+        Ok(mut f) => {
+            let _ = writeln!(
+                f,
+                "pid={} acquired_at={}",
+                std::process::id(),
+                Local::now().to_rfc3339()
+            );
+            Some(DailyActiveLock { path })
+        }
+        Err(_) => None,
+    }
+}
+
 fn load_daily_active_sent_date() -> Option<String> {
     let path = daily_active_path()?;
     let s = std::fs::read_to_string(&path).ok()?;
@@ -213,17 +255,21 @@ fn start_daily_active_telemetry(install_id: String) {
     std::thread::spawn(move || loop {
         let local_date = Local::now().format("%Y-%m-%d").to_string();
         if load_daily_active_sent_date().as_deref() != Some(local_date.as_str()) {
-            match send_daily_active(&install_id, &local_date) {
-                Ok(()) => {
-                    save_daily_active_sent_date(&local_date);
-                    log_info(&format!(
-                        "telemetry: sent app_daily_active for {local_date}"
-                    ));
-                }
-                Err(e) => {
-                    log_warn(&format!(
-                        "telemetry: app_daily_active failed for {local_date}: {e}"
-                    ));
+            if let Some(_lock) = try_acquire_daily_active_lock() {
+                if load_daily_active_sent_date().as_deref() != Some(local_date.as_str()) {
+                    match send_daily_active(&install_id, &local_date) {
+                        Ok(()) => {
+                            save_daily_active_sent_date(&local_date);
+                            log_info(&format!(
+                                "telemetry: sent app_daily_active for {local_date}"
+                            ));
+                        }
+                        Err(e) => {
+                            log_warn(&format!(
+                                "telemetry: app_daily_active failed for {local_date}: {e}"
+                            ));
+                        }
+                    }
                 }
             }
         }
