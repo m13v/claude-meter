@@ -10,12 +10,8 @@ pub enum Browser {
 }
 
 impl Browser {
-    pub const ALL: &'static [Browser] = &[
-        Browser::Chrome,
-        Browser::Arc,
-        Browser::Brave,
-        Browser::Edge,
-    ];
+    pub const ALL: &'static [Browser] =
+        &[Browser::Chrome, Browser::Arc, Browser::Brave, Browser::Edge];
 
     pub fn display_name(&self) -> &'static str {
         match self {
