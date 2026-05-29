@@ -40,8 +40,14 @@ Click **Always Allow**. The app then reads your Chrome cookie database directly 
 
 ## Privacy
 
-- No telemetry, no analytics, no network egress beyond `claude.ai` itself.
-- All cookies, tokens, and API responses stay on your machine.
+- Usage data stays local: cookies, tokens, prompts, account emails, org IDs,
+  hostnames, and Claude API responses are never sent to us.
+- Anonymous health telemetry is enabled by default: crash reports and one
+  `app_daily_active` ping per local day, keyed by a random install ID. The daily
+  ping includes app version, platform, and local date only.
+- Disable all telemetry with `CLAUDE_METER_NO_TELEMETRY=1`. Disable only crash
+  reporting with `CLAUDE_METER_NO_SENTRY=1`.
+- Aside from that anonymous telemetry, network egress is to `claude.ai` itself.
 - The menu-bar app's bridge (`127.0.0.1:63762`) is localhost-only.
 - Open source (MIT), audit it.
 
