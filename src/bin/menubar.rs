@@ -17,8 +17,14 @@ use tray_icon::menu::{
 use tray_icon::{TrayIcon, TrayIconBuilder, TrayIconEvent};
 
 /// Sentry DSN for the `claude-meter` project in the Mediar org. Compiled in
-/// because this is a desktop app; users can opt out via `CLAUDE_METER_NO_SENTRY=1`.
+/// because this is a desktop app; users can opt out via `CLAUDE_METER_NO_SENTRY=1`
+/// or disable all outbound telemetry with `CLAUDE_METER_NO_TELEMETRY=1`.
 const SENTRY_DSN: &str = "https://2a67e355b17fd4e2da6cc2e135f765f8@o4507617161314304.ingest.us.sentry.io/4511372322209792";
+
+/// Server-side PostHog bridge for a once-daily anonymous active-install event.
+/// The website endpoint hashes the install ID before forwarding to PostHog.
+const TELEMETRY_ENDPOINT: &str = "https://claude-meter.com/api/telemetry/daily-active";
+const DAILY_ACTIVE_CHECK_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
 /// Log file path under ~/Library/Logs/ClaudeMeter/menubar.log. Lazily opened
 /// the first time `log_line` runs; appended to until the process exits. No
@@ -34,6 +40,14 @@ static LAST_TITLE_TEXT: Mutex<Option<String>> = Mutex::new(None);
 
 fn log_dir() -> Option<PathBuf> {
     dirs::home_dir().map(|p| p.join("Library").join("Logs").join("ClaudeMeter"))
+}
+
+fn app_support_dir() -> Option<PathBuf> {
+    dirs::home_dir().map(|p| {
+        p.join("Library")
+            .join("Application Support")
+            .join("claude-meter")
+    })
 }
 
 /// Persistent anonymous install ID for Sentry user attribution.
@@ -54,10 +68,7 @@ fn log_dir() -> Option<PathBuf> {
 /// (extremely unlikely on macOS); callers gracefully skip setting the user
 /// in that case and fall back to hostname.
 fn get_or_create_install_id() -> Option<String> {
-    let dir = dirs::home_dir()?
-        .join("Library")
-        .join("Application Support")
-        .join("claude-meter");
+    let dir = app_support_dir()?;
     std::fs::create_dir_all(&dir).ok()?;
     let path = dir.join("install_id");
 
@@ -89,6 +100,135 @@ fn get_or_create_install_id() -> Option<String> {
     );
     std::fs::write(&path, &id).ok()?;
     Some(id)
+}
+
+fn telemetry_disabled() -> bool {
+    std::env::var("CLAUDE_METER_NO_TELEMETRY").is_ok()
+}
+
+fn daily_active_path() -> Option<PathBuf> {
+    app_support_dir().map(|p| p.join("daily_active_sent_date.txt"))
+}
+
+fn load_daily_active_sent_date() -> Option<String> {
+    let path = daily_active_path()?;
+    let s = std::fs::read_to_string(&path).ok()?;
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn save_daily_active_sent_date(local_date: &str) {
+    let Some(path) = daily_active_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, local_date);
+}
+
+fn telemetry_endpoint() -> String {
+    std::env::var("CLAUDE_METER_TELEMETRY_URL")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| TELEMETRY_ENDPOINT.to_string())
+}
+
+#[derive(Serialize)]
+struct DailyActivePayload<'a> {
+    install_id: &'a str,
+    app_version: &'a str,
+    local_date: &'a str,
+    platform: &'a str,
+    source: &'a str,
+    surface: &'a str,
+}
+
+#[derive(Deserialize)]
+struct DailyActiveAck {
+    ok: bool,
+    error: Option<String>,
+}
+
+fn send_daily_active(install_id: &str, local_date: &str) -> Result<(), String> {
+    let endpoint = telemetry_endpoint();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("build telemetry runtime: {e}"))?;
+
+    rt.block_on(async move {
+        let client = rquest::Client::builder()
+            .build()
+            .map_err(|e| format!("build telemetry client: {e}"))?;
+        let payload = DailyActivePayload {
+            install_id,
+            app_version: env!("CARGO_PKG_VERSION"),
+            local_date,
+            platform: "macos",
+            source: "desktop_app",
+            surface: "macos_menubar",
+        };
+        let resp = client
+            .post(&endpoint)
+            .header(
+                "User-Agent",
+                format!("ClaudeMeter/{} (macOS)", env!("CARGO_PKG_VERSION")),
+            )
+            .json(&payload)
+            .send()
+            .await
+            .map_err(|e| format!("POST {endpoint}: {e}"))?;
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(format!(
+                "POST {endpoint} returned {}: {}",
+                status.as_u16(),
+                truncate(&body, 200)
+            ));
+        }
+        let ack: DailyActiveAck = serde_json::from_str(&body).map_err(|e| {
+            format!(
+                "decode telemetry response: {e}; body={}",
+                truncate(&body, 200)
+            )
+        })?;
+        if ack.ok {
+            Ok(())
+        } else {
+            Err(format!(
+                "telemetry endpoint rejected event: {}",
+                ack.error.unwrap_or_else(|| "unknown".to_string())
+            ))
+        }
+    })
+}
+
+fn start_daily_active_telemetry(install_id: String) {
+    std::thread::spawn(move || loop {
+        let local_date = Local::now().format("%Y-%m-%d").to_string();
+        if load_daily_active_sent_date().as_deref() != Some(local_date.as_str()) {
+            match send_daily_active(&install_id, &local_date) {
+                Ok(()) => {
+                    save_daily_active_sent_date(&local_date);
+                    log_info(&format!(
+                        "telemetry: sent app_daily_active for {local_date}"
+                    ));
+                }
+                Err(e) => {
+                    log_warn(&format!(
+                        "telemetry: app_daily_active failed for {local_date}: {e}"
+                    ));
+                }
+            }
+        }
+        std::thread::sleep(DAILY_ACTIVE_CHECK_INTERVAL);
+    });
 }
 
 fn open_log_file() -> Option<std::fs::File> {
@@ -130,8 +270,12 @@ fn log_line(level: &str, msg: &str) {
     });
 }
 
-fn log_info(msg: &str) { log_line("info", msg); }
-fn log_warn(msg: &str) { log_line("warn", msg); }
+fn log_info(msg: &str) {
+    log_line("info", msg);
+}
+fn log_warn(msg: &str) {
+    log_line("warn", msg);
+}
 fn log_error(msg: &str) {
     log_line("error", msg);
     sentry::capture_message(msg, sentry::Level::Error);
@@ -333,13 +477,19 @@ enum AppEvent {
 fn main() -> Result<()> {
     // Sentry init before anything else so panics in startup are captured.
     // Held in a binding so the guard isn't dropped until the process exits.
-    let _sentry_guard = if std::env::var("CLAUDE_METER_NO_SENTRY").is_err() {
+    let telemetry_opt_out = telemetry_disabled();
+    let _sentry_guard = if !telemetry_opt_out && std::env::var("CLAUDE_METER_NO_SENTRY").is_err() {
         Some(sentry::init((
             SENTRY_DSN,
             sentry::ClientOptions {
                 release: Some(format!("claude-meter@{}", env!("CARGO_PKG_VERSION")).into()),
                 environment: Some(
-                    if cfg!(debug_assertions) { "debug" } else { "release" }.into(),
+                    if cfg!(debug_assertions) {
+                        "debug"
+                    } else {
+                        "release"
+                    }
+                    .into(),
                 ),
                 attach_stacktrace: true,
                 send_default_pii: false,
@@ -351,14 +501,19 @@ fn main() -> Result<()> {
     } else {
         None
     };
-    // Stable anonymous install ID so Sentry can distinguish users without
-    // relying on hostname (which collides on macOS defaults like
+    // Stable anonymous install ID so Sentry/PostHog can distinguish installs
+    // without relying on hostname (which collides on macOS defaults like
     // `MacBook-Air.local`). See `get_or_create_install_id` for the storage
     // contract. Set before the heartbeat so the very first event already
     // carries `user.id`, which means historical analytics start working
     // immediately rather than after the next captured event.
+    let install_id = if _sentry_guard.is_some() || !telemetry_opt_out {
+        get_or_create_install_id()
+    } else {
+        None
+    };
     if _sentry_guard.is_some() {
-        if let Some(install_id) = get_or_create_install_id() {
+        if let Some(install_id) = install_id.clone() {
             sentry::configure_scope(|scope| {
                 scope.set_user(Some(sentry::User {
                     id: Some(install_id),
@@ -375,13 +530,23 @@ fn main() -> Result<()> {
     if _sentry_guard.is_some() {
         log_capture(
             "info",
-            &format!("claude-meter v{} startup heartbeat", env!("CARGO_PKG_VERSION")),
+            &format!(
+                "claude-meter v{} startup heartbeat",
+                env!("CARGO_PKG_VERSION")
+            ),
         );
     } else {
         log_info(&format!(
             "claude-meter v{} starting (sentry disabled)",
             env!("CARGO_PKG_VERSION")
         ));
+    }
+    if telemetry_opt_out {
+        log_info("anonymous telemetry disabled via CLAUDE_METER_NO_TELEMETRY");
+    } else if let Some(install_id) = install_id {
+        start_daily_active_telemetry(install_id);
+    } else {
+        log_warn("telemetry: could not create install ID; daily active tracking disabled");
     }
 
     #[cfg(target_os = "macos")]
@@ -693,9 +858,7 @@ fn main() -> Result<()> {
                 if new_fmt != config.title_format {
                     config.title_format = new_fmt;
                     save_config(&config);
-                    if let (Some(tray), Some(snaps)) =
-                        (tray_icon.as_ref(), last_snaps.as_deref())
-                    {
+                    if let (Some(tray), Some(snaps)) = (tray_icon.as_ref(), last_snaps.as_deref()) {
                         current_ids = render_menu_only(
                             tray,
                             snaps,
@@ -720,9 +883,7 @@ fn main() -> Result<()> {
                     blink.active = false;
                     dirty = true;
                 }
-                if let (Some(tray), Some(snaps)) =
-                    (tray_icon.as_ref(), last_snaps.as_deref())
-                {
+                if let (Some(tray), Some(snaps)) = (tray_icon.as_ref(), last_snaps.as_deref()) {
                     current_ids = render_menu_only(
                         tray,
                         snaps,
@@ -748,9 +909,7 @@ fn main() -> Result<()> {
                 blink_dismissed = true;
                 blink.active = false;
                 blink.red_phase = false;
-                if let (Some(tray), Some(snaps)) =
-                    (tray_icon.as_ref(), last_snaps.as_deref())
-                {
+                if let (Some(tray), Some(snaps)) = (tray_icon.as_ref(), last_snaps.as_deref()) {
                     current_ids = render_menu_only(
                         tray,
                         snaps,
@@ -764,7 +923,9 @@ fn main() -> Result<()> {
                 continue;
             }
             if let Some(url) = current_ids.open_urls.get(&menu_event.id) {
-                let _ = std::process::Command::new("/usr/bin/open").arg(url).status();
+                let _ = std::process::Command::new("/usr/bin/open")
+                    .arg(url)
+                    .status();
                 continue;
             }
             if let Some(key) = current_ids.forget_account.get(&menu_event.id).cloned() {
@@ -831,7 +992,10 @@ struct BlinkState {
 }
 
 impl BlinkState {
-    const OFF: BlinkState = BlinkState { active: false, red_phase: false };
+    const OFF: BlinkState = BlinkState {
+        active: false,
+        red_phase: false,
+    };
 }
 
 fn apply_title(
@@ -852,13 +1016,22 @@ fn apply_title(
     let mut segs = if let Some(s) = snaps {
         let mut segs = title_segments(fmt, s, preferred_browser);
         if error.is_some() {
-            segs.push(TitleSeg { text: " !".into(), bg: None });
+            segs.push(TitleSeg {
+                text: " !".into(),
+                bg: None,
+            });
         }
         segs
     } else if error.is_some() {
-        vec![TitleSeg { text: "Claude: !".into(), bg: None }]
+        vec![TitleSeg {
+            text: "Claude: !".into(),
+            bg: None,
+        }]
     } else {
-        vec![TitleSeg { text: "Claude: …".into(), bg: None }]
+        vec![TitleSeg {
+            text: "Claude: …".into(),
+            bg: None,
+        }]
     };
 
     // Blink override: when active, force every segment's background to a
@@ -866,7 +1039,11 @@ fn apply_title(
     // phase. We override rather than additively layer so the whole bar
     // visibly flips together, which is what the user asked for.
     if blink.active {
-        let bg = if blink.red_phase { Some(BLINK_RED) } else { None };
+        let bg = if blink.red_phase {
+            Some(BLINK_RED)
+        } else {
+            None
+        };
         for s in segs.iter_mut() {
             s.bg = bg;
         }
@@ -904,7 +1081,11 @@ fn apply_title(
     };
     let err_present = error.is_some();
     let blink_active = blink.active;
-    let path = if !applied { "fallback-tray" } else { "native-macos" };
+    let path = if !applied {
+        "fallback-tray"
+    } else {
+        "native-macos"
+    };
     if let Ok(mut guard) = LAST_TITLE_TEXT.lock() {
         let changed = match guard.as_ref() {
             Some(prev) => prev != &rendered_text,
@@ -989,9 +1170,12 @@ fn smart_interval(
     // High-utilization fast path: if any window is in the danger zone, keep
     // the bar (and the alarm threshold check) responsive.
     let high_util = new_snaps.iter().any(|s| {
-        let Some(u) = s.usage.as_ref() else { return false };
+        let Some(u) = s.usage.as_ref() else {
+            return false;
+        };
         let any = |w: Option<&claude_meter::models::Window>| {
-            w.map(|w| w.utilization >= HIGH_UTIL_FAST_POLL).unwrap_or(false)
+            w.map(|w| w.utilization >= HIGH_UTIL_FAST_POLL)
+                .unwrap_or(false)
         };
         any(u.five_hour.as_ref())
             || any(u.seven_day.as_ref())
@@ -1047,14 +1231,11 @@ fn account_switch_watcher_loop(refresh_tx: mpsc::Sender<()>) {
         path.display(),
         ACCOUNT_SWITCH_POLL.as_millis()
     ));
-    let mut last_mtime: Option<std::time::SystemTime> = std::fs::metadata(&path)
-        .and_then(|m| m.modified())
-        .ok();
+    let mut last_mtime: Option<std::time::SystemTime> =
+        std::fs::metadata(&path).and_then(|m| m.modified()).ok();
     loop {
         std::thread::sleep(ACCOUNT_SWITCH_POLL);
-        let current = std::fs::metadata(&path)
-            .and_then(|m| m.modified())
-            .ok();
+        let current = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
         match (current, last_mtime) {
             (Some(curr), Some(prev)) if curr != prev => {
                 log_info("account-switch sentinel changed; triggering refresh");
@@ -1207,10 +1388,7 @@ fn keychain_watcher_loop(refresh_tx: mpsc::Sender<()>) {
     }
 }
 
-fn poll_loop(
-    proxy: EventLoopProxy<AppEvent>,
-    refresh_rx: mpsc::Receiver<()>,
-) {
+fn poll_loop(proxy: EventLoopProxy<AppEvent>, refresh_rx: mpsc::Receiver<()>) {
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -1411,9 +1589,17 @@ fn max_five_hour_utilization(
 ) -> Option<(f64, Option<chrono::DateTime<chrono::Utc>>)> {
     let mut best: Option<(f64, Option<chrono::DateTime<chrono::Utc>>)> = None;
     for s in snaps {
-        let Some(usage) = s.usage.as_ref() else { continue };
-        let Some(window) = usage.five_hour.as_ref() else { continue };
-        if best.as_ref().map(|b| window.utilization > b.0).unwrap_or(true) {
+        let Some(usage) = s.usage.as_ref() else {
+            continue;
+        };
+        let Some(window) = usage.five_hour.as_ref() else {
+            continue;
+        };
+        if best
+            .as_ref()
+            .map(|b| window.utilization > b.0)
+            .unwrap_or(true)
+        {
             best = Some((window.utilization, window.resets_at));
         }
     }
@@ -1467,7 +1653,10 @@ fn default_browser_name() -> Option<String> {
     let mut depth = 0usize;
     for ch in text.chars() {
         match ch {
-            '{' => { depth += 1; current.clear(); }
+            '{' => {
+                depth += 1;
+                current.clear();
+            }
             '}' => {
                 if depth == 1 && current.contains("LSHandlerURLScheme = https;") {
                     let bundle = current
@@ -1483,11 +1672,15 @@ fn default_browser_name() -> Option<String> {
                         })?;
                     return bundle_id_to_name(bundle);
                 }
-                if depth > 0 { depth -= 1; }
+                if depth > 0 {
+                    depth -= 1;
+                }
                 current.clear();
             }
             _ => {
-                if depth > 0 { current.push(ch); }
+                if depth > 0 {
+                    current.push(ch);
+                }
             }
         }
     }
@@ -1495,15 +1688,18 @@ fn default_browser_name() -> Option<String> {
 }
 
 fn bundle_id_to_name(id: String) -> Option<String> {
-    Some(match id.as_str() {
-        "com.google.chrome" | "com.google.Chrome" => "Chrome",
-        "company.thebrowser.Browser" | "company.thebrowser.browser" => "Arc",
-        "com.brave.browser" | "com.brave.Browser" => "Brave",
-        "com.microsoft.edgemac" => "Edge",
-        "com.apple.safari" | "com.apple.Safari" => "Safari",
-        "com.operasoftware.Opera" => "Opera",
-        _ => return None,
-    }.to_string())
+    Some(
+        match id.as_str() {
+            "com.google.chrome" | "com.google.Chrome" => "Chrome",
+            "company.thebrowser.Browser" | "company.thebrowser.browser" => "Arc",
+            "com.brave.browser" | "com.brave.Browser" => "Brave",
+            "com.microsoft.edgemac" => "Edge",
+            "com.apple.safari" | "com.apple.Safari" => "Safari",
+            "com.operasoftware.Opera" => "Opera",
+            _ => return None,
+        }
+        .to_string(),
+    )
 }
 
 async fn fetch_all() -> Result<Vec<UsageSnapshot>, String> {
@@ -1625,18 +1821,12 @@ fn build_menu(
                 .ok();
             }
             if let Some(w) = u.seven_day_sonnet.as_ref() {
-                sub.append(&disabled(&format!(
-                    "7-day Sonnet {:>5.1}%",
-                    w.utilization
-                )))
-                .ok();
+                sub.append(&disabled(&format!("7-day Sonnet {:>5.1}%", w.utilization)))
+                    .ok();
             }
             if let Some(w) = u.seven_day_opus.as_ref() {
-                sub.append(&disabled(&format!(
-                    "7-day Opus   {:>5.1}%",
-                    w.utilization
-                )))
-                .ok();
+                sub.append(&disabled(&format!("7-day Opus   {:>5.1}%", w.utilization)))
+                    .ok();
             }
         }
 
@@ -1646,7 +1836,11 @@ fn build_menu(
             let line = match ov.monthly_credit_limit {
                 Some(l) => {
                     let limit = l as f64 / 100.0;
-                    let pct = if limit > 0.0 { used / limit * 100.0 } else { 0.0 };
+                    let pct = if limit > 0.0 {
+                        used / limit * 100.0
+                    } else {
+                        0.0
+                    };
                     format!(
                         "Extra        ${:.2} / ${:.2} ({:.0}%){}",
                         used, limit, pct, blocked
@@ -1690,19 +1884,15 @@ fn build_menu(
     // Title-format picker: each row previews the format applied to live data.
     let fmt_sub = Submenu::new("Menu bar style", true);
     for variant in [TitleFormat::Long, TitleFormat::Medium, TitleFormat::Compact] {
-        let item = CheckMenuItem::new(
-            format_title(variant, snaps),
-            true,
-            variant == fmt,
-            None,
-        );
+        let item = CheckMenuItem::new(format_title(variant, snaps), true, variant == fmt, None);
         format_items.insert(item.id().clone(), variant);
         fmt_sub.append(&item).ok();
     }
     menu.append(&fmt_sub).ok();
 
     if let Some(t) = fetched {
-        menu.append(&disabled(&format!("Updated {}", t.format("%H:%M:%S")))).ok();
+        menu.append(&disabled(&format!("Updated {}", t.format("%H:%M:%S"))))
+            .ok();
     }
 
     // Alarm controls: a single toggle ("Sound on (alerts at 95%)" / "Sound
@@ -1710,10 +1900,7 @@ fn build_menu(
     // works without waiting to actually hit 95%. Default on; persisted in
     // config.json under `alarm_enabled`.
     let alarm_toggle = CheckMenuItem::new(
-        format!(
-            "Sound alarm at {}% (5h window)",
-            alarm_threshold() as i64
-        ),
+        format!("Sound alarm at {}% (5h window)", alarm_threshold() as i64),
         true,
         alarm_enabled,
         None,
@@ -1757,7 +1944,10 @@ fn account_label(s: &UsageSnapshot) -> String {
     } else {
         String::new()
     };
-    format!("{} [{}]  [{:.0}% / {:.0}%]{}{}", who, browser, five, seven, warn, stale)
+    format!(
+        "{} [{}]  [{:.0}% / {:.0}%]{}{}",
+        who, browser, five, seven, warn, stale
+    )
 }
 
 fn pretty_browser(b: &str) -> &str {
@@ -1770,11 +1960,17 @@ fn pretty_browser(b: &str) -> &str {
         "chromium" => "Chromium",
         "extension" | "" => "browser",
         other => {
-            if other.contains("chrome") { "Chrome" }
-            else if other.contains("edge") { "Edge" }
-            else if other.contains("brave") { "Brave" }
-            else if other.contains("arc") { "Arc" }
-            else { "browser" }
+            if other.contains("chrome") {
+                "Chrome"
+            } else if other.contains("edge") {
+                "Edge"
+            } else if other.contains("brave") {
+                "Brave"
+            } else if other.contains("arc") {
+                "Arc"
+            } else {
+                "browser"
+            }
         }
     }
 }
@@ -1800,21 +1996,22 @@ fn merge_with_persisted(
     // Key snapshots by (browser, account) so a POST from one browser
     // doesn't disturb another browser's entries.
     type Key = (String, String);
-    let key_of = |s: &UsageSnapshot| -> Key {
-        (s.browser.to_lowercase(), account_key(s).to_string())
-    };
-    let fresh_browsers: std::collections::HashSet<String> = fresh
-        .iter()
-        .map(|s| s.browser.to_lowercase())
-        .collect();
+    let key_of =
+        |s: &UsageSnapshot| -> Key { (s.browser.to_lowercase(), account_key(s).to_string()) };
+    let fresh_browsers: std::collections::HashSet<String> =
+        fresh.iter().map(|s| s.browser.to_lowercase()).collect();
     let mut by_key: std::collections::HashMap<Key, UsageSnapshot> =
         std::collections::HashMap::new();
     for mut s in fresh {
         s.stale = false;
         let k = key_of(&s);
         match by_key.get(&k) {
-            None => { by_key.insert(k, s); }
-            Some(existing) if prefer(&s, existing) => { by_key.insert(k, s); }
+            None => {
+                by_key.insert(k, s);
+            }
+            Some(existing) if prefer(&s, existing) => {
+                by_key.insert(k, s);
+            }
             _ => {}
         }
     }
@@ -1862,8 +2059,12 @@ fn snapshots_path() -> Option<PathBuf> {
 }
 
 fn load_snapshots() -> Vec<UsageSnapshot> {
-    let Some(path) = snapshots_path() else { return Vec::new() };
-    let Ok(s) = std::fs::read_to_string(&path) else { return Vec::new() };
+    let Some(path) = snapshots_path() else {
+        return Vec::new();
+    };
+    let Ok(s) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
     let mut snaps: Vec<UsageSnapshot> = serde_json::from_str(&s).unwrap_or_default();
     // Drop any persisted entries from the old multi-account era that aren't
     // tagged with the OAuth source. They'd otherwise resurface as stale rows.
@@ -1898,9 +2099,7 @@ fn save_backoff_until(dur_from_now: Duration) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let deadline = match std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-    {
+    let deadline = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
         Ok(d) => d + dur_from_now,
         Err(_) => return,
     };
@@ -1965,7 +2164,9 @@ fn token_fingerprint_path() -> Option<PathBuf> {
 }
 
 fn save_token_fingerprint(fp: &str) {
-    let Some(path) = token_fingerprint_path() else { return };
+    let Some(path) = token_fingerprint_path() else {
+        return;
+    };
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -1976,7 +2177,11 @@ fn load_token_fingerprint() -> Option<String> {
     let path = token_fingerprint_path()?;
     let s = std::fs::read_to_string(&path).ok()?;
     let trimmed = s.trim();
-    if trimmed.is_empty() { None } else { Some(trimmed.to_string()) }
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
 }
 
 fn util_five(s: &UsageSnapshot) -> f64 {
@@ -2052,7 +2257,11 @@ fn title_segments(
                 .copied()
                 .filter(|s| pretty_browser(&s.browser).to_lowercase() == want_lc)
                 .collect();
-            if filtered.is_empty() { live_all } else { filtered }
+            if filtered.is_empty() {
+                live_all
+            } else {
+                filtered
+            }
         }
         None => live_all,
     };
@@ -2074,7 +2283,11 @@ fn title_segments(
                     .copied()
                     .filter(|s| pretty_browser(&s.browser).to_lowercase() == want_lc)
                     .collect();
-                if filtered.is_empty() { all } else { filtered }
+                if filtered.is_empty() {
+                    all
+                } else {
+                    filtered
+                }
             }
             None => all,
         }
@@ -2096,21 +2309,39 @@ fn title_segments(
         let five = util_five(s);
         let seven = util_seven(s);
         match fmt {
-            TitleFormat::Long => segs.push(TitleSeg { text: "Claude  5h ".into(), bg: None }),
-            TitleFormat::Medium => segs.push(TitleSeg { text: "5h ".into(), bg: None }),
+            TitleFormat::Long => segs.push(TitleSeg {
+                text: "Claude  5h ".into(),
+                bg: None,
+            }),
+            TitleFormat::Medium => segs.push(TitleSeg {
+                text: "5h ".into(),
+                bg: None,
+            }),
             TitleFormat::Compact => {}
         }
-        segs.push(TitleSeg { text: format!("{:.0}%", five), bg: bg_for(five) });
+        segs.push(TitleSeg {
+            text: format!("{:.0}%", five),
+            bg: bg_for(five),
+        });
         let sep = match fmt {
             TitleFormat::Long => "  ·  ",
             TitleFormat::Medium => " · ",
             TitleFormat::Compact => " · ",
         };
-        segs.push(TitleSeg { text: sep.into(), bg: None });
+        segs.push(TitleSeg {
+            text: sep.into(),
+            bg: None,
+        });
         if matches!(fmt, TitleFormat::Long | TitleFormat::Medium) {
-            segs.push(TitleSeg { text: "7d ".into(), bg: None });
+            segs.push(TitleSeg {
+                text: "7d ".into(),
+                bg: None,
+            });
         }
-        segs.push(TitleSeg { text: format!("{:.0}%", seven), bg: bg_for(seven) });
+        segs.push(TitleSeg {
+            text: format!("{:.0}%", seven),
+            bg: bg_for(seven),
+        });
     } else {
         let between = match fmt {
             TitleFormat::Long => "     ",
@@ -2118,31 +2349,65 @@ fn title_segments(
             TitleFormat::Compact => "  ",
         };
         if matches!(fmt, TitleFormat::Long) {
-            segs.push(TitleSeg { text: "Claude  ".into(), bg: None });
+            segs.push(TitleSeg {
+                text: "Claude  ".into(),
+                bg: None,
+            });
         }
         for (i, s) in live.iter().enumerate() {
             if i > 0 {
-                segs.push(TitleSeg { text: between.into(), bg: None });
+                segs.push(TitleSeg {
+                    text: between.into(),
+                    bg: None,
+                });
             }
             let tag = account_tag(s);
-            segs.push(TitleSeg { text: format!("{}: ", tag), bg: None });
+            segs.push(TitleSeg {
+                text: format!("{}: ", tag),
+                bg: None,
+            });
             let five = util_five(s);
             let seven = util_seven(s);
             match fmt {
                 TitleFormat::Long | TitleFormat::Medium => {
-                    segs.push(TitleSeg { text: "5h ".into(), bg: None });
-                    segs.push(TitleSeg { text: format!("{:.0}%", five), bg: bg_for(five) });
                     segs.push(TitleSeg {
-                        text: if matches!(fmt, TitleFormat::Long) { "  ·  ".into() } else { " · ".into() },
+                        text: "5h ".into(),
                         bg: None,
                     });
-                    segs.push(TitleSeg { text: "7d ".into(), bg: None });
-                    segs.push(TitleSeg { text: format!("{:.0}%", seven), bg: bg_for(seven) });
+                    segs.push(TitleSeg {
+                        text: format!("{:.0}%", five),
+                        bg: bg_for(five),
+                    });
+                    segs.push(TitleSeg {
+                        text: if matches!(fmt, TitleFormat::Long) {
+                            "  ·  ".into()
+                        } else {
+                            " · ".into()
+                        },
+                        bg: None,
+                    });
+                    segs.push(TitleSeg {
+                        text: "7d ".into(),
+                        bg: None,
+                    });
+                    segs.push(TitleSeg {
+                        text: format!("{:.0}%", seven),
+                        bg: bg_for(seven),
+                    });
                 }
                 TitleFormat::Compact => {
-                    segs.push(TitleSeg { text: format!("{:.0}", five), bg: bg_for(five) });
-                    segs.push(TitleSeg { text: "·".into(), bg: None });
-                    segs.push(TitleSeg { text: format!("{:.0}", seven), bg: bg_for(seven) });
+                    segs.push(TitleSeg {
+                        text: format!("{:.0}", five),
+                        bg: bg_for(five),
+                    });
+                    segs.push(TitleSeg {
+                        text: "·".into(),
+                        bg: None,
+                    });
+                    segs.push(TitleSeg {
+                        text: format!("{:.0}", seven),
+                        bg: bg_for(seven),
+                    });
                 }
             }
         }
@@ -2262,7 +2527,6 @@ fn set_macos_accessory() {
 
 #[cfg(target_os = "macos")]
 mod macos_title {
-    use std::cell::RefCell;
     use objc2::class;
     use objc2::msg_send;
     use objc2::rc::Retained;
@@ -2276,6 +2540,7 @@ mod macos_title {
         MainThreadMarker, NSAttributedString, NSDictionary, NSMutableAttributedString,
         NSMutableDictionary, NSString,
     };
+    use std::cell::RefCell;
 
     thread_local! {
         static BUTTON: RefCell<Option<Retained<NSStatusBarButton>>> = const { RefCell::new(None) };
@@ -2352,7 +2617,9 @@ mod macos_title {
     }
 
     pub fn set_title(segments: &[Segment]) -> bool {
-        let Some(mtm) = MainThreadMarker::new() else { return false };
+        let Some(mtm) = MainThreadMarker::new() else {
+            return false;
+        };
         BUTTON.with(|slot| {
             let mut b = slot.borrow_mut();
             if b.is_none() {
@@ -2387,8 +2654,7 @@ mod macos_title {
             for seg in segments {
                 let dict: Retained<NSMutableDictionary<NSString, AnyObject>> =
                     NSMutableDictionary::new();
-                let _: () =
-                    msg_send![&*dict, setObject: &*font, forKey: NSFontAttributeName];
+                let _: () = msg_send![&*dict, setObject: &*font, forKey: NSFontAttributeName];
                 if let Some((r, g, b)) = seg.bg {
                     let bg_c = NSColor::colorWithSRGBRed_green_blue_alpha(
                         r as f64 / 255.0,
@@ -2445,7 +2711,9 @@ mod tests {
         assert_eq!(s, " · resets in 2h");
 
         // 1h 45m: hours + minutes (under 2h gets minute precision)
-        let s = reset_suffix(Some(now + Duration::hours(1) + Duration::minutes(45) + Duration::seconds(15)));
+        let s = reset_suffix(Some(
+            now + Duration::hours(1) + Duration::minutes(45) + Duration::seconds(15),
+        ));
         assert_eq!(s, " · resets in 1h 45m");
 
         // 45m: minutes only
