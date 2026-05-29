@@ -89,9 +89,7 @@ fn build_client() -> Result<Client> {
     // Don't pass `default_headers` here — it would override rquest-util's
     // emulation-installed Chrome header set (sec-ch-ua, user-agent, sec-fetch-*),
     // which Cloudflare checks. Pass Cookie/Referer/Accept per-request instead.
-    let client = Client::builder()
-        .emulation(Emulation::Chrome131)
-        .build()?;
+    let client = Client::builder().emulation(Emulation::Chrome131).build()?;
     Ok(client)
 }
 
