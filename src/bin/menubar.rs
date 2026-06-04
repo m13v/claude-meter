@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use chrono::{DateTime, Local};
-use claude_meter::{dedupe_by_account, models::UsageSnapshot, oauth};
+use claude_meter::{models::UsageSnapshot, oauth};
 use serde::{Deserialize, Serialize};
 use tao::event::Event;
 use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
@@ -2033,71 +2033,6 @@ fn short_last_seen(t: chrono::DateTime<chrono::Utc>) -> String {
     } else {
         local.format("%H:%M").to_string()
     }
-}
-
-fn merge_with_persisted(
-    fresh: Vec<UsageSnapshot>,
-    persisted: Vec<UsageSnapshot>,
-) -> Vec<UsageSnapshot> {
-    // Key snapshots by (browser, account) so a POST from one browser
-    // doesn't disturb another browser's entries.
-    type Key = (String, String);
-    let key_of =
-        |s: &UsageSnapshot| -> Key { (s.browser.to_lowercase(), account_key(s).to_string()) };
-    let fresh_browsers: std::collections::HashSet<String> =
-        fresh.iter().map(|s| s.browser.to_lowercase()).collect();
-    let mut by_key: std::collections::HashMap<Key, UsageSnapshot> =
-        std::collections::HashMap::new();
-    for mut s in fresh {
-        s.stale = false;
-        let k = key_of(&s);
-        match by_key.get(&k) {
-            None => {
-                by_key.insert(k, s);
-            }
-            Some(existing) if prefer(&s, existing) => {
-                by_key.insert(k, s);
-            }
-            _ => {}
-        }
-    }
-    let stale_cutoff = chrono::Utc::now() - chrono::Duration::hours(2);
-    for mut old in persisted {
-        let k = key_of(&old);
-        if by_key.contains_key(&k) {
-            continue;
-        }
-        if old.fetched_at < stale_cutoff {
-            continue;
-        }
-        // Only mark as stale if we just received a post from the SAME browser
-        // and the account wasn't in it. Entries from other browsers keep
-        // their previous state (don't get demoted to stale just because a
-        // different browser posted).
-        if fresh_browsers.contains(&old.browser.to_lowercase()) {
-            old.stale = true;
-        }
-        by_key.insert(k, old);
-    }
-    let merged: Vec<UsageSnapshot> = by_key.into_values().collect();
-    // Final pass: collapse rows that point at the same account but have
-    // different `browser` keys, e.g. an old persisted "Arc" row for
-    // mattdiak@... alongside a new "Claude Code, Arc" row from the OAuth
-    // refactor. Sort fresh-first so dedupe_by_account picks fresh as the
-    // winner and back-fills any subscription/overage from the stale duplicate.
-    let mut sorted = merged;
-    sorted.sort_by_key(|s| (s.stale, std::cmp::Reverse(s.fetched_at)));
-    dedupe_by_account(sorted)
-}
-
-fn prefer(a: &UsageSnapshot, b: &UsageSnapshot) -> bool {
-    // Prefer the snapshot with a usage body and the freshest fetch.
-    match (a.usage.is_some(), b.usage.is_some()) {
-        (true, false) => return true,
-        (false, true) => return false,
-        _ => {}
-    }
-    a.fetched_at > b.fetched_at
 }
 
 fn snapshots_path() -> Option<PathBuf> {
