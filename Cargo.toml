@@ -24,13 +24,7 @@ path = "src/bin/menubar.rs"
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
-rusqlite = { version = "0.32", features = ["bundled"] }
-aes = "0.8"
-cbc = { version = "0.1", features = ["alloc", "block-padding"] }
-pbkdf2 = "0.12"
-sha1 = "0.10"
 rquest = { version = "5", features = ["json"] }
-rquest-util = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
