@@ -2,10 +2,9 @@
 //!
 //! Reads the OAuth credentials Claude Code stashes in the macOS Keychain under
 //! service `Claude Code-credentials` and queries the OAuth-authenticated
-//! endpoints on `api.anthropic.com`. This avoids the browser-cookie /
-//! Cloudflare path entirely; it's the cleanest source for the *active* CLI
-//! account. The cookie path is still used as a fallback (and to surface other
-//! browser-logged-in accounts the OAuth token can't see).
+//! endpoints on `api.anthropic.com`. This is the sole usage source: it avoids
+//! the browser-cookie / Cloudflare path entirely and covers the account the
+//! active Claude Code CLI is logged into.
 //!
 //! Endpoints used (token scope `user:profile` is sufficient):
 //!   GET https://api.anthropic.com/api/oauth/usage     (rolling-window quotas + extra_usage)
@@ -14,8 +13,8 @@
 //! Token refresh is intentionally NOT implemented here: the running Claude
 //! Code CLI rotates the access token automatically (it has the refresh token
 //! and the right OAuth client credentials). claude-meter just reads whatever
-//! is in the keychain. If the token is expired we bail and let the cookie
-//! path take over.
+//! is in the keychain. If the token is expired we bail with a message telling
+//! the user to run `claude` once.
 
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -115,8 +114,7 @@ pub async fn fetch_oauth_snapshot() -> Result<UsageSnapshot> {
         .await
         .context("fetch /api/oauth/usage")?;
 
-    // /api/oauth/profile gives us account email + org uuid for display and
-    // dedupe_by_account.
+    // /api/oauth/profile gives us account email + org uuid for display.
     let profile: OAuthProfile =
         get_json(&client, token, &format!("{API_BASE}/api/oauth/profile"))
             .await
@@ -129,9 +127,8 @@ pub async fn fetch_oauth_snapshot() -> Result<UsageSnapshot> {
         fetched_at: Utc::now(),
         usage: Some(usage),
         // Stripe-flavoured subscription_details and the dedicated
-        // overage_spend_limit endpoint are not exposed via OAuth scopes; they
-        // require the claude.ai web session cookies. The cookie path fills
-        // those in if/when it runs.
+        // overage_spend_limit endpoint are not exposed via OAuth scopes, so
+        // these fields stay empty.
         overage: None,
         subscription: None,
         errors: Vec::new(),
