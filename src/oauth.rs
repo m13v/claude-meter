@@ -20,11 +20,14 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use rquest::Client;
 use serde::Deserialize;
+use std::time::Duration;
 
 use crate::models::{UsageResponse, UsageSnapshot};
 
 const KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
 const API_BASE: &str = "https://api.anthropic.com";
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// What the keychain blob looks like:
 /// ```json
@@ -105,7 +108,12 @@ pub async fn fetch_oauth_snapshot() -> Result<UsageSnapshot> {
 
     // Plain rquest client; api.anthropic.com is not behind Cloudflare's bot
     // gate, so no Chrome fingerprint emulation needed (unlike claude.ai).
-    let client = Client::builder().build().context("build rquest client")?;
+    let client = Client::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .read_timeout(REQUEST_TIMEOUT)
+        .timeout(REQUEST_TIMEOUT)
+        .build()
+        .context("build rquest client")?;
     let token = creds.access_token.as_str();
 
     // /api/oauth/usage carries the rolling-window utilization AND the
