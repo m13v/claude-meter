@@ -422,6 +422,10 @@ const RATE_LIMIT_BACKOFF_LADDER: &[Duration] = &[
 /// the silence we'd be trying to avoid). The user can quit the app
 /// manually if a header value ever goes pathological.
 const RETRY_AFTER_MIN: Duration = Duration::from_secs(30);
+/// Hard ceiling for one complete OAuth usage/profile fetch. Network stacks can
+/// otherwise leave the single poll thread parked forever on a half-open TLS
+/// connection, which freezes snapshots.json and leaves the rotator blind.
+const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Utilization (%) on the 5-hour rolling window at which the alarm fires.
 const ALARM_THRESHOLD_DEFAULT: f64 = 95.0;
@@ -1486,7 +1490,17 @@ fn poll_loop(proxy: EventLoopProxy<AppEvent>, refresh_rx: mpsc::Receiver<()>) {
 
     loop {
         let _ = proxy.send_event(AppEvent::Refreshing);
-        let result = rt.block_on(fetch_all());
+        let result = match rt.block_on(tokio::time::timeout(FETCH_TIMEOUT, fetch_all())) {
+            Ok(result) => result,
+            Err(_) => {
+                let message = format!(
+                    "oauth fetch timed out after {}s",
+                    FETCH_TIMEOUT.as_secs()
+                );
+                log_warn(&message);
+                Err(message)
+            }
+        };
         let rate_limited = match &result {
             Err(e) => is_rate_limit_error(e),
             Ok(_) => false,
