@@ -1,9 +1,11 @@
 use std::collections::HashMap;
 use std::fs::OpenOptions;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::PathBuf;
+use std::process::{Command, Stdio};
 use std::sync::{mpsc, Mutex};
-use std::time::Duration;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use chrono::{DateTime, Local};
@@ -322,11 +324,6 @@ fn log_info(msg: &str) {
 fn log_warn(msg: &str) {
     log_line("warn", msg);
 }
-fn log_error(msg: &str) {
-    log_line("error", msg);
-    sentry::capture_message(msg, sentry::Level::Error);
-}
-
 /// Capture a real Sentry event (not just a breadcrumb) at the given level.
 /// Use sparingly: for things we want to be able to query in Sentry, like
 /// alarm fires or process startup, not for routine 429 backoffs.
@@ -1439,20 +1436,6 @@ fn keychain_watcher_loop(refresh_tx: mpsc::Sender<()>) {
 }
 
 fn poll_loop(proxy: EventLoopProxy<AppEvent>, refresh_rx: mpsc::Receiver<()>) {
-    let rt = match tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-    {
-        Ok(rt) => rt,
-        Err(e) => {
-            log_error(&format!("could not start tokio runtime: {e}"));
-            let _ = proxy.send_event(AppEvent::Snapshots(Err(format!(
-                "could not start tokio runtime: {e}"
-            ))));
-            return;
-        }
-    };
-
     // Always poll OAuth on every tick. The previous bridge-freshness skip was
     // built for the multi-source era, where browser-extension POSTs were a
     // legitimate alternate source. Now that fetch_all is OAuth-only, suppressing
@@ -1490,17 +1473,7 @@ fn poll_loop(proxy: EventLoopProxy<AppEvent>, refresh_rx: mpsc::Receiver<()>) {
 
     loop {
         let _ = proxy.send_event(AppEvent::Refreshing);
-        let result = match rt.block_on(tokio::time::timeout(FETCH_TIMEOUT, fetch_all())) {
-            Ok(result) => result,
-            Err(_) => {
-                let message = format!(
-                    "oauth fetch timed out after {}s",
-                    FETCH_TIMEOUT.as_secs()
-                );
-                log_warn(&message);
-                Err(message)
-            }
-        };
+        let result = fetch_all();
         let rate_limited = match &result {
             Err(e) => is_rate_limit_error(e),
             Ok(_) => false,
@@ -1762,19 +1735,74 @@ fn bundle_id_to_name(id: String) -> Option<String> {
     )
 }
 
-async fn fetch_all() -> Result<Vec<UsageSnapshot>, String> {
+fn fetch_all() -> Result<Vec<UsageSnapshot>, String> {
     // OAuth-only: the menu bar surfaces the active Claude Code CLI account,
     // not whatever else might be logged into the user's browsers. Cookie-source
     // multi-account aggregation was removed because users found it confusing
     // to see another account's quota in the bar (e.g. mediar.ai showing 93%
     // while the active CLI account was at 32%).
-    match oauth::fetch_oauth_snapshot().await {
-        Ok(s) => Ok(vec![s]),
-        Err(e) => {
-            log_warn(&format!("oauth fetch failed: {e:#}"));
-            Err(format!("oauth: {e:#}"))
+    //
+    // The rquest/BoringSSL stack can block its executor thread inside a TLS
+    // handshake, which means neither a Tokio timeout nor the client's own
+    // timeout can always preempt it. Run each poll in the bundled CLI helper
+    // process instead. The menu bar can then SIGKILL a wedged poll after the
+    // deadline without freezing its own loop or snapshots.json forever.
+    let helper = std::env::current_exe()
+        .map_err(|e| format!("locate menubar executable: {e}"))?
+        .with_file_name("claude-meter");
+    let mut child = Command::new(&helper)
+        .arg("--json")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("start OAuth poll helper {}: {e}", helper.display()))?;
+    let deadline = Instant::now() + FETCH_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(100)),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let message = format!(
+                    "oauth fetch timed out after {}s; killed poll helper",
+                    FETCH_TIMEOUT.as_secs()
+                );
+                log_warn(&message);
+                return Err(message);
+            }
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("wait for OAuth poll helper: {e}"));
+            }
         }
+    };
+
+    let mut stdout = String::new();
+    if let Some(mut pipe) = child.stdout.take() {
+        pipe.read_to_string(&mut stdout)
+            .map_err(|e| format!("read OAuth poll helper stdout: {e}"))?;
     }
+    let mut stderr = String::new();
+    if let Some(mut pipe) = child.stderr.take() {
+        let _ = pipe.read_to_string(&mut stderr);
+    }
+
+    if !status.success() {
+        let detail = stderr.trim();
+        let message = if detail.is_empty() {
+            format!("OAuth poll helper exited with {status}")
+        } else {
+            format!("OAuth poll helper exited with {status}: {detail}")
+        };
+        log_warn(&format!("oauth fetch failed: {message}"));
+        return Err(message);
+    }
+
+    let snapshot: UsageSnapshot = serde_json::from_str(&stdout)
+        .map_err(|e| format!("parse OAuth poll helper JSON: {e}"))?;
+    Ok(vec![snapshot])
 }
 
 struct MenuIds {
