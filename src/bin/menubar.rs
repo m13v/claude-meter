@@ -3,7 +3,7 @@ use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::sync::{mpsc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -343,13 +343,13 @@ fn log_capture(level: &str, msg: &str) {
 /// too-fast triggers 429s, too-slow leaves the bar stale during active use.
 ///
 /// Strategy (see `smart_interval`):
-///   - HIGH-USE FAST PATH: if any window utilization ≥ 80%, poll every 90s so
-///     the alarm threshold (95%) and the title number stay responsive.
+///   - HIGH-USE FAST PATH: if 5h utilization ≥ 80%, hold the cadence at the
+///     floor so the alarm threshold (95%) and the title number stay responsive.
 ///   - ACTIVITY FAST PATH: if the last snapshot's numbers changed, poll again
-///     in 90s (active CLI session, numbers will keep moving).
+///     at the floor (active CLI session, numbers will keep moving).
 ///   - IDLE GEOMETRIC SLOWDOWN: when the snapshot is identical N polls in a
 ///     row, back off 180s → 240s → 320s → 420s → 600s. Reset on any change.
-const POLL_MIN: Duration = Duration::from_secs(90);
+const POLL_MIN: Duration = Duration::from_secs(180);
 const POLL_BASE: Duration = Duration::from_secs(180);
 const POLL_MAX: Duration = Duration::from_secs(600);
 /// External "the keychain blob just changed, re-fetch now" sentinel.
@@ -373,6 +373,11 @@ const ACCOUNT_SWITCH_POLL: Duration = Duration::from_millis(1500);
 /// next OAuth poll (which can be up to 600s away, or longer inside a 429
 /// backoff window from the previous account).
 const KEYCHAIN_POLL: Duration = Duration::from_secs(15);
+/// Automatic refresh signals can arrive as a pair on every account rotation:
+/// the rotator touches the sentinel, then the keychain fingerprint watcher
+/// sees the same swap a few seconds later. One fetch is enough to observe the
+/// new account; the second fetch just burns scarce `/api/oauth/usage` budget.
+const AUTO_REFRESH_DEDUPE_WINDOW: Duration = Duration::from_secs(30);
 /// Utilization (%) at or above which we switch to the fast cadence. Sits below
 /// the alarm threshold so the user gets multiple ticks of warning before fire.
 const HIGH_UTIL_FAST_POLL: f64 = 80.0;
@@ -423,6 +428,41 @@ const RETRY_AFTER_MIN: Duration = Duration::from_secs(30);
 /// otherwise leave the single poll thread parked forever on a half-open TLS
 /// connection, which freezes snapshots.json and leaves the rotator blind.
 const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[derive(Clone)]
+struct AutoRefreshTrigger {
+    tx: mpsc::Sender<()>,
+    last_sent: Arc<Mutex<Option<Instant>>>,
+}
+
+impl AutoRefreshTrigger {
+    fn new(tx: mpsc::Sender<()>) -> Self {
+        Self {
+            tx,
+            last_sent: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    fn trigger(&self, reason: &str) -> bool {
+        let now = Instant::now();
+        let mut last_sent = self.last_sent.lock().expect("auto refresh mutex poisoned");
+        if let Some(prev) = *last_sent {
+            let elapsed = now.saturating_duration_since(prev);
+            if elapsed < AUTO_REFRESH_DEDUPE_WINDOW {
+                log_info(&format!(
+                    "{reason}; refresh suppressed (last automatic refresh {}s ago)",
+                    elapsed.as_secs()
+                ));
+                return true;
+            }
+        }
+        *last_sent = Some(now);
+        drop(last_sent);
+
+        log_info(&format!("{reason}; triggering refresh"));
+        self.tx.send(()).is_ok()
+    }
+}
 
 /// Utilization (%) on the 5-hour rolling window at which the alarm fires.
 const ALARM_THRESHOLD_DEFAULT: f64 = 95.0;
@@ -611,6 +651,7 @@ fn main() -> Result<()> {
     let proxy = event_loop.create_proxy();
     let blink_proxy = event_loop.create_proxy();
     let (refresh_tx, refresh_rx) = mpsc::channel::<()>();
+    let auto_refresh = AutoRefreshTrigger::new(refresh_tx.clone());
 
     // External-rotator integration: an outside tool (claude-acct, etc.) can
     // touch `~/.config/ClaudeMeter/refresh_now` after swapping the Claude
@@ -620,16 +661,16 @@ fn main() -> Result<()> {
     // the OLD account's usage numbers for up to ~10 minutes (idle cadence)
     // or for the remainder of any active 429 backoff.
     {
-        let watcher_tx = refresh_tx.clone();
-        std::thread::spawn(move || account_switch_watcher_loop(watcher_tx));
+        let watcher_refresh = auto_refresh.clone();
+        std::thread::spawn(move || account_switch_watcher_loop(watcher_refresh));
     }
 
     // Keychain-fingerprint watcher: catches `claude login` and any other path
     // that changes the OAuth blob without touching the sentinel file. See
     // `keychain_watcher_loop` for log policy and rationale.
     {
-        let watcher_tx = refresh_tx.clone();
-        std::thread::spawn(move || keychain_watcher_loop(watcher_tx));
+        let watcher_refresh = auto_refresh.clone();
+        std::thread::spawn(move || keychain_watcher_loop(watcher_refresh));
     }
 
     // Bridge listener (port 63762) was the legacy cookie-source path that
