@@ -356,11 +356,11 @@ const POLL_MAX: Duration = Duration::from_secs(600);
 /// An external tool (e.g. `claude-acct` from ~/claude-account-rotator) touches
 /// `~/.config/ClaudeMeter/refresh_now` after rotating the `Claude Code-credentials`
 /// keychain entry. The watcher thread polls that file's mtime at
-/// `ACCOUNT_SWITCH_POLL` cadence and pokes the same `refresh_tx` channel the
-/// "Refresh now" menu item uses, so the menu bar shows the new account's
-/// numbers within ~1–2s of the swap instead of waiting for the next scheduled
-/// poll (which can be up to 600s away on the idle cadence, or longer if we're
-/// inside a 429 backoff window from the previous account).
+/// `ACCOUNT_SWITCH_POLL` cadence and pokes the automatic refresh path, so the
+/// menu bar shows the new account's numbers within ~1–2s of the swap instead
+/// of waiting for the next scheduled poll (which can be up to 600s away on the
+/// idle cadence, or longer if we're inside a 429 backoff window from the
+/// previous account).
 const ACCOUNT_SWITCH_SENTINEL_FILENAME: &str = "refresh_now";
 const ACCOUNT_SWITCH_POLL: Duration = Duration::from_millis(1500);
 
@@ -656,10 +656,9 @@ fn main() -> Result<()> {
     // External-rotator integration: an outside tool (claude-acct, etc.) can
     // touch `~/.config/ClaudeMeter/refresh_now` after swapping the Claude
     // Code OAuth blob in the keychain. The watcher thread converts that
-    // mtime change into a poke on `refresh_tx`, identical to clicking the
-    // "Refresh now" menu item. Without this, the menu bar would keep showing
-    // the OLD account's usage numbers for up to ~10 minutes (idle cadence)
-    // or for the remainder of any active 429 backoff.
+    // mtime change into an automatic refresh signal. Without this, the menu
+    // bar would keep showing the OLD account's usage numbers for up to ~10
+    // minutes (idle cadence) or for the remainder of any active 429 backoff.
     {
         let watcher_refresh = auto_refresh.clone();
         std::thread::spawn(move || account_switch_watcher_loop(watcher_refresh));
@@ -1354,10 +1353,9 @@ fn account_switch_watcher_loop(refresh_trigger: AutoRefreshTrigger) {
 ///   None of those touch the sentinel.
 ///
 /// Compares the OAuth access token as a string. On any difference, pokes the
-/// same `refresh_tx` channel the sentinel uses, so the menu bar refetches
-/// usage against the new blob and bypasses any in-flight 429 wall-clock
-/// backoff (which was tied to the previous token's bucket and no longer
-/// applies).
+/// same automatic refresh path the sentinel uses, so the menu bar refetches
+/// usage against the new blob and bypasses any in-flight 429 wall-clock backoff
+/// (which was tied to the previous token's bucket and no longer applies).
 ///
 /// Log policy (designed for tracing account-switch and 429 issues later):
 ///   - Startup: one `info` line with the initial 16-hex fingerprint, ISO
@@ -1373,7 +1371,7 @@ fn account_switch_watcher_loop(refresh_trigger: AutoRefreshTrigger) {
 /// Cost of a spurious refresh on routine token rotation: one HTTP call. The
 /// CLI rotates the token roughly every 8 hours, so the upper bound on
 /// "unnecessary" refetches is ~3/day. Acceptable.
-fn keychain_watcher_loop(refresh_tx: mpsc::Sender<()>) {
+fn keychain_watcher_loop(refresh_trigger: AutoRefreshTrigger) {
     log_info(&format!(
         "keychain watcher: starting (poll={}s)",
         KEYCHAIN_POLL.as_secs()
@@ -1402,10 +1400,10 @@ fn keychain_watcher_loop(refresh_tx: mpsc::Sender<()>) {
             ));
             match persisted_fp.as_deref() {
                 Some(prev) if prev != curr_fp => {
-                    log_info(&format!(
-                        "keychain changed while process was down (was={prev} now={curr_fp}); triggering refresh"
-                    ));
-                    if refresh_tx.send(()).is_err() {
+                    let reason = format!(
+                        "keychain changed while process was down (was={prev} now={curr_fp})"
+                    );
+                    if !refresh_trigger.trigger(&reason) {
                         return;
                     }
                 }
@@ -1441,13 +1439,13 @@ fn keychain_watcher_loop(refresh_tx: mpsc::Sender<()>) {
                         .map(token_fingerprint)
                         .unwrap_or_else(|| "<none>".to_string());
                     let new_fp = token_fingerprint(&creds.access_token);
-                    log_info(&format!(
-                        "keychain fingerprint changed (was={old_fp} now={new_fp} expires={} sub={} tier={}); triggering refresh",
+                    let reason = format!(
+                        "keychain fingerprint changed (was={old_fp} now={new_fp} expires={} sub={} tier={})",
                         iso_expiry_ms(creds.expires_at),
                         creds.subscription_type.as_deref().unwrap_or("?"),
                         creds.rate_limit_tier.as_deref().unwrap_or("?"),
-                    ));
-                    if refresh_tx.send(()).is_err() {
+                    );
+                    if !refresh_trigger.trigger(&reason) {
                         // Receiver dropped (app exiting). Exit cleanly.
                         return;
                     }
