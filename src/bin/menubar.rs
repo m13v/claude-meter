@@ -1255,22 +1255,19 @@ fn smart_interval(
     new_snaps: &[UsageSnapshot],
     unchanged_streak: u32,
 ) -> Duration {
-    // High-utilization fast path: if any window is in the danger zone, keep
-    // the bar (and the alarm threshold check) responsive.
-    let high_util = new_snaps.iter().any(|s| {
+    // High-utilization fast path: only the 5h window needs the tight cadence.
+    // Weekly windows move slowly; pinning 80%+ weekly accounts to the floor
+    // was enough to trip Anthropic's `/api/oauth/usage` 429 bucket.
+    let high_five_hour_util = new_snaps.iter().any(|s| {
         let Some(u) = s.usage.as_ref() else {
             return false;
         };
-        let any = |w: Option<&claude_meter::models::Window>| {
-            w.map(|w| w.utilization >= HIGH_UTIL_FAST_POLL)
-                .unwrap_or(false)
-        };
-        any(u.five_hour.as_ref())
-            || any(u.seven_day.as_ref())
-            || any(u.seven_day_sonnet.as_ref())
-            || any(u.seven_day_opus.as_ref())
+        u.five_hour
+            .as_ref()
+            .map(|w| w.utilization >= HIGH_UTIL_FAST_POLL)
+            .unwrap_or(false)
     });
-    if high_util {
+    if high_five_hour_util {
         return POLL_MIN;
     }
     // Activity fast path: if the numbers (or account set) changed since the
@@ -1306,7 +1303,7 @@ fn smart_interval(
 /// is mtime-only, payload is irrelevant). It also remembers the initial mtime
 /// on startup so a sentinel that already exists (left over from a previous
 /// session) does NOT trigger a refresh until the next external touch.
-fn account_switch_watcher_loop(refresh_tx: mpsc::Sender<()>) {
+fn account_switch_watcher_loop(refresh_trigger: AutoRefreshTrigger) {
     let path = match dirs::config_dir() {
         Some(p) => p.join("ClaudeMeter").join(ACCOUNT_SWITCH_SENTINEL_FILENAME),
         None => {
@@ -1326,8 +1323,7 @@ fn account_switch_watcher_loop(refresh_tx: mpsc::Sender<()>) {
         let current = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
         match (current, last_mtime) {
             (Some(curr), Some(prev)) if curr != prev => {
-                log_info("account-switch sentinel changed; triggering refresh");
-                if refresh_tx.send(()).is_err() {
+                if !refresh_trigger.trigger("account-switch sentinel changed") {
                     // Receiver dropped (app exiting). Exit the thread cleanly.
                     return;
                 }
@@ -1337,8 +1333,7 @@ fn account_switch_watcher_loop(refresh_tx: mpsc::Sender<()>) {
                 // Sentinel appeared after we started without one. Treat it as
                 // a switch — the external rotator just ran for the first time
                 // since we booted.
-                log_info("account-switch sentinel appeared; triggering refresh");
-                if refresh_tx.send(()).is_err() {
+                if !refresh_trigger.trigger("account-switch sentinel appeared") {
                     return;
                 }
                 last_mtime = Some(curr);
