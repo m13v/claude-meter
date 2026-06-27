@@ -1,9 +1,13 @@
 use anyhow::Result;
-use claude_meter::{format, oauth};
 use clap::Parser;
+use claude_meter::{format, oauth};
 
 #[derive(Parser)]
-#[command(name = "claude-meter", version, about = "Live Claude plan usage and extra-usage balance")]
+#[command(
+    name = "claude-meter",
+    version,
+    about = "Live Claude plan usage and extra-usage balance"
+)]
 struct Cli {
     /// Emit machine-readable JSON
     #[arg(long)]
