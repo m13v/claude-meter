@@ -69,8 +69,8 @@ pub fn read_token() -> Result<OAuthCreds> {
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
-    let raw = String::from_utf8(out.stdout)
-        .context("Claude Code keychain blob was not valid UTF-8")?;
+    let raw =
+        String::from_utf8(out.stdout).context("Claude Code keychain blob was not valid UTF-8")?;
     let blob: KeychainBlob = serde_json::from_str(raw.trim()).with_context(|| {
         let snippet = &raw[..raw.len().min(80)];
         format!("parse Claude Code credentials JSON (head: {snippet:?})")
@@ -123,10 +123,9 @@ pub async fn fetch_oauth_snapshot() -> Result<UsageSnapshot> {
         .context("fetch /api/oauth/usage")?;
 
     // /api/oauth/profile gives us account email + org uuid for display.
-    let profile: OAuthProfile =
-        get_json(&client, token, &format!("{API_BASE}/api/oauth/profile"))
-            .await
-            .context("fetch /api/oauth/profile")?;
+    let profile: OAuthProfile = get_json(&client, token, &format!("{API_BASE}/api/oauth/profile"))
+        .await
+        .context("fetch /api/oauth/profile")?;
 
     Ok(UsageSnapshot {
         org_uuid: profile.organization.uuid,
@@ -175,9 +174,9 @@ async fn get_json<T: serde::de::DeserializeOwned>(
     if !status.is_success() {
         let snippet = &body[..body.len().min(300)];
         match retry_after {
-            Some(secs) => anyhow::bail!(
-                "HTTP {status} from {url} (retry-after={secs}s): {snippet}"
-            ),
+            Some(secs) => {
+                anyhow::bail!("HTTP {status} from {url} (retry-after={secs}s): {snippet}")
+            }
             None => anyhow::bail!("HTTP {status} from {url}: {snippet}"),
         }
     }
