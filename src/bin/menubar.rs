@@ -348,10 +348,14 @@ fn log_capture(level: &str, msg: &str) {
 ///   - ACTIVITY FAST PATH: if the last snapshot's numbers changed, poll again
 ///     at the floor (active CLI session, numbers will keep moving).
 ///   - IDLE GEOMETRIC SLOWDOWN: when the snapshot is identical N polls in a
-///     row, back off 180s → 240s → 320s → 420s → 600s. Reset on any change.
-const POLL_MIN: Duration = Duration::from_secs(180);
-const POLL_BASE: Duration = Duration::from_secs(180);
-const POLL_MAX: Duration = Duration::from_secs(600);
+///     row, back off 900s → 1200s → 1500s → 1800s. Reset on any change.
+///
+/// The endpoint has repeatedly 429'd after a handful of 3-minute polls while
+/// usage was actively changing. Keep the menu useful, but stay below the
+/// observed per-hour bucket.
+const POLL_MIN: Duration = Duration::from_secs(900);
+const POLL_BASE: Duration = Duration::from_secs(900);
+const POLL_MAX: Duration = Duration::from_secs(1800);
 /// External "the keychain blob just changed, re-fetch now" sentinel.
 /// An external tool (e.g. `claude-acct` from ~/claude-account-rotator) touches
 /// `~/.config/ClaudeMeter/refresh_now` after rotating the `Claude Code-credentials`
@@ -424,6 +428,9 @@ const RATE_LIMIT_BACKOFF_LADDER: &[Duration] = &[
 /// the silence we'd be trying to avoid). The user can quit the app
 /// manually if a header value ever goes pathological.
 const RETRY_AFTER_MIN: Duration = Duration::from_secs(30);
+/// Add a small cushion to server Retry-After values. Retrying exactly at the
+/// boundary has been enough to receive another 3600s 429 loop.
+const RETRY_AFTER_CUSHION: Duration = Duration::from_secs(300);
 /// Hard ceiling for one complete OAuth usage/profile fetch. Network stacks can
 /// otherwise leave the single poll thread parked forever on a half-open TLS
 /// connection, which freezes snapshots.json and leaves the rotator blind.
@@ -1278,9 +1285,9 @@ fn smart_interval(
     // snapshots *after* the first one, so streak=0 still gets POLL_BASE.
     match unchanged_streak {
         0..=1 => POLL_BASE,
-        2 => Duration::from_secs(240),
-        3 => Duration::from_secs(320),
-        4 => Duration::from_secs(420),
+        2 => Duration::from_secs(1200),
+        3 => Duration::from_secs(1500),
+        4 => Duration::from_secs(1800),
         _ => POLL_MAX,
     }
 }
@@ -1521,7 +1528,7 @@ fn poll_loop(proxy: EventLoopProxy<AppEvent>, refresh_rx: mpsc::Receiver<()>) {
         };
         let retry_after_hint: Option<Duration> = match &result {
             Err(e) => parse_retry_after_seconds(e)
-                .map(|secs| Duration::from_secs(secs).max(RETRY_AFTER_MIN)),
+                .map(|secs| Duration::from_secs(secs).max(RETRY_AFTER_MIN) + RETRY_AFTER_CUSHION),
             Ok(_) => None,
         };
         let _ = proxy.send_event(AppEvent::Snapshots(result));
@@ -1834,8 +1841,8 @@ fn fetch_all() -> Result<Vec<UsageSnapshot>, String> {
         return Err(message);
     }
 
-    let snapshot: UsageSnapshot = serde_json::from_str(&stdout)
-        .map_err(|e| format!("parse OAuth poll helper JSON: {e}"))?;
+    let snapshot: UsageSnapshot =
+        serde_json::from_str(&stdout).map_err(|e| format!("parse OAuth poll helper JSON: {e}"))?;
     Ok(vec![snapshot])
 }
 
