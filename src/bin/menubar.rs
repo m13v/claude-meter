@@ -522,6 +522,9 @@ const ALARM_REPEATS: usize = 3;
 /// from peripheral vision.
 const BLINK_INTERVAL: Duration = Duration::from_millis(500);
 
+/// Cadence of the minute ticker thread
+const MINUTE_INTERVAL: Duration = Duration::from_secs(60);
+
 /// RGB for the "alert" phase of the blink and for the >=100% solid color.
 const BLINK_RED: (u8, u8, u8) = (215, 58, 73);
 
@@ -567,10 +570,19 @@ struct Config {
     /// alarm fires once per window; rolls over with `resets_at`.
     #[serde(default = "default_alarm_enabled")]
     alarm_enabled: bool,
+    /// When true, append the remaining time of the 5h and 7d windows to
+    /// their percentages in the menu bar title, e.g.
+    /// "5h 37% (1h12m) · 7d 10% (3d4h)". Off by default; toggled from the menu.
+    #[serde(default = "default_show_remaining_time")]
+    show_remaining_time: bool,
 }
 
 fn default_alarm_enabled() -> bool {
     true
+}
+
+fn default_show_remaining_time() -> bool {
+    false
 }
 
 impl Default for Config {
@@ -579,6 +591,7 @@ impl Default for Config {
             title_format: TitleFormat::default(),
             preferred_browser: None,
             alarm_enabled: true,
+            show_remaining_time: false,
         }
     }
 }
@@ -590,6 +603,7 @@ enum AppEvent {
     /// when the visual alarm is active (utilization >= ALARM_THRESHOLD and the
     /// user hasn't dismissed it for the current window).
     BlinkTick,
+    MinuteTick,
 }
 
 fn main() -> Result<()> {
@@ -681,6 +695,7 @@ fn main() -> Result<()> {
     let event_loop = EventLoopBuilder::<AppEvent>::with_user_event().build();
     let proxy = event_loop.create_proxy();
     let blink_proxy = event_loop.create_proxy();
+    let minute_proxy = event_loop.create_proxy();
     let (refresh_tx, refresh_rx) = mpsc::channel::<()>();
     let auto_refresh = AutoRefreshTrigger::new(refresh_tx.clone());
 
@@ -719,6 +734,17 @@ fn main() -> Result<()> {
         loop {
             std::thread::sleep(BLINK_INTERVAL);
             if blink_proxy.send_event(AppEvent::BlinkTick).is_err() {
+                // Event loop closed (app exiting) — stop ticking.
+                break;
+            }
+        }
+    });
+
+    // Minute ticker. Sends MinuteTick every minute regardless of state
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(MINUTE_INTERVAL);
+            if minute_proxy.send_event(AppEvent::MinuteTick).is_err() {
                 // Event loop closed (app exiting) — stop ticking.
                 break;
             }
@@ -767,6 +793,7 @@ fn main() -> Result<()> {
                 last_fetched,
                 config.title_format,
                 config.alarm_enabled,
+                config.show_remaining_time,
                 blink.active,
             );
         }
@@ -786,6 +813,7 @@ fn main() -> Result<()> {
             None,
             config.title_format,
             config.preferred_browser.as_deref(),
+            config.show_remaining_time,
             blink,
         );
     }
@@ -916,6 +944,7 @@ fn main() -> Result<()> {
                             last_fetched,
                             config.title_format,
                             config.alarm_enabled,
+                            config.show_remaining_time,
                             blink.active,
                         );
                     }
@@ -954,6 +983,25 @@ fn main() -> Result<()> {
                             last_error.as_deref(),
                             config.title_format,
                             config.preferred_browser.as_deref(),
+                            config.show_remaining_time,
+                            blink,
+                        );
+                    }
+                }
+            }
+            Event::UserEvent(AppEvent::MinuteTick) => {
+                // Nothing else repaints between polls (15–30 min apart), so roll
+                // the reset countdowns once a minute. Skip while the alarm is
+                // blinking — that already repaints at its own cadence.
+                if config.show_remaining_time && !blink.active {
+                    if let Some(tray) = tray_icon.as_ref() {
+                        apply_title(
+                            tray,
+                            last_snaps.as_deref(),
+                            last_error.as_deref(),
+                            config.title_format,
+                            config.preferred_browser.as_deref(),
+                            config.show_remaining_time,
                             blink,
                         );
                     }
@@ -983,11 +1031,29 @@ fn main() -> Result<()> {
                             last_fetched,
                             config.title_format,
                             config.alarm_enabled,
+                            config.show_remaining_time,
                             blink.active,
                         );
                     }
                     dirty = true;
                 }
+                continue;
+            }
+            if current_ids.remaining_toggle.as_ref() == Some(&menu_event.id) {
+                config.show_remaining_time = !config.show_remaining_time;
+                save_config(&config);
+                if let (Some(tray), Some(snaps)) = (tray_icon.as_ref(), last_snaps.as_deref()) {
+                    current_ids = render_menu_only(
+                        tray,
+                        snaps,
+                        last_fetched,
+                        config.title_format,
+                        config.alarm_enabled,
+                        config.show_remaining_time,
+                        blink.active,
+                    );
+                }
+                dirty = true;
                 continue;
             }
             if current_ids.alarm_toggle.as_ref() == Some(&menu_event.id) {
@@ -1008,6 +1074,7 @@ fn main() -> Result<()> {
                         last_fetched,
                         config.title_format,
                         config.alarm_enabled,
+                        config.show_remaining_time,
                         blink.active,
                     );
                 }
@@ -1034,6 +1101,7 @@ fn main() -> Result<()> {
                         last_fetched,
                         config.title_format,
                         config.alarm_enabled,
+                        config.show_remaining_time,
                         blink.active,
                     );
                 }
@@ -1057,6 +1125,7 @@ fn main() -> Result<()> {
                             last_fetched,
                             config.title_format,
                             config.alarm_enabled,
+                            config.show_remaining_time,
                             blink.active,
                         );
                     }
@@ -1074,6 +1143,7 @@ fn main() -> Result<()> {
                     last_error.as_deref(),
                     config.title_format,
                     config.preferred_browser.as_deref(),
+                    config.show_remaining_time,
                     blink,
                 );
             }
@@ -1087,9 +1157,17 @@ fn render_menu_only(
     fetched: Option<DateTime<Local>>,
     fmt: TitleFormat,
     alarm_enabled: bool,
+    remaining_enabled: bool,
     alarm_visual_active: bool,
 ) -> MenuIds {
-    let (menu, ids) = build_menu(snaps, fetched, fmt, alarm_enabled, alarm_visual_active);
+    let (menu, ids) = build_menu(
+        snaps,
+        fetched,
+        fmt,
+        alarm_enabled,
+        remaining_enabled,
+        alarm_visual_active,
+    );
     let _ = tray.set_menu(Some(Box::new(menu)));
     ids
 }
@@ -1122,6 +1200,7 @@ fn apply_title(
     error: Option<&str>,
     fmt: TitleFormat,
     preferred_browser: Option<&str>,
+    remaining_enabled: bool,
     blink: BlinkState,
 ) {
     // Title precedence:
@@ -1132,7 +1211,7 @@ fn apply_title(
     //   - no snaps + error: bare "Claude: !" (we have nothing else to show).
     //   - no snaps + no error: "Claude: …" (still loading).
     let mut segs = if let Some(s) = snaps {
-        let mut segs = title_segments(fmt, s, preferred_browser);
+        let mut segs = title_segments(fmt, s, preferred_browser, remaining_enabled);
         if error.is_some() {
             segs.push(TitleSeg {
                 text: " !".into(),
@@ -1888,6 +1967,8 @@ struct MenuIds {
     alarm_toggle: Option<MenuId>,
     /// "Test alarm sound" — fires the alarm on demand.
     alarm_test: Option<MenuId>,
+    /// "Show remaining time in window" toggle for the title countdowns.
+    remaining_toggle: Option<MenuId>,
     /// "Dismiss alarm" item, only present while the visual alarm (blinking
     /// title) is active. Clicking it silences the blink for the current
     /// 5-hour window; the blink re-arms automatically when the window rolls.
@@ -1904,6 +1985,7 @@ impl MenuIds {
             quit,
             alarm_toggle: None,
             alarm_test: None,
+            remaining_toggle: None,
             dismiss_alarm: None,
             open_urls: HashMap::new(),
             format_items: HashMap::new(),
@@ -1941,6 +2023,7 @@ fn build_menu(
     fetched: Option<DateTime<Local>>,
     fmt: TitleFormat,
     alarm_enabled: bool,
+    remaining_enabled: bool,
     alarm_visual_active: bool,
 ) -> (Menu, MenuIds) {
     let menu = Menu::new();
@@ -2047,11 +2130,26 @@ fn build_menu(
     // Title-format picker: each row previews the format applied to live data.
     let fmt_sub = Submenu::new("Menu bar style", true);
     for variant in [TitleFormat::Long, TitleFormat::Medium, TitleFormat::Compact] {
-        let item = CheckMenuItem::new(format_title(variant, snaps), true, variant == fmt, None);
+        let item = CheckMenuItem::new(
+            format_title(variant, snaps, remaining_enabled),
+            true,
+            variant == fmt,
+            None,
+        );
         format_items.insert(item.id().clone(), variant);
         fmt_sub.append(&item).ok();
     }
     menu.append(&fmt_sub).ok();
+
+    // Remaining-time toggle: shows/hides the per-window reset countdown in
+    // the title across every format. Persisted under `show_remaining_time`.
+    let remaining_toggle = CheckMenuItem::new(
+        "Show remaining time in window",
+        true,
+        remaining_enabled,
+        None,
+    );
+    menu.append(&remaining_toggle).ok();
 
     if let Some(t) = fetched {
         menu.append(&disabled(&format!("Updated {}", t.format("%H:%M:%S"))))
@@ -2084,6 +2182,7 @@ fn build_menu(
             quit: quit.id().clone(),
             alarm_toggle: Some(alarm_toggle.id().clone()),
             alarm_test: Some(alarm_test.id().clone()),
+            remaining_toggle: Some(remaining_toggle.id().clone()),
             dismiss_alarm,
             open_urls,
             format_items,
@@ -2343,6 +2442,7 @@ fn title_segments(
     fmt: TitleFormat,
     snaps: &[UsageSnapshot],
     preferred_browser: Option<&str>,
+    show_remaining: bool,
 ) -> Vec<TitleSeg> {
     // First pass: only non-stale snapshots, filtered by preferred browser if
     // available. This is the happy path during normal operation.
@@ -2421,6 +2521,14 @@ fn title_segments(
             text: format!("{:.0}%", five),
             bg: bg_for(five),
         });
+        if show_remaining {
+            if let Some(cd) = short_countdown(five_hour_reset(s)) {
+                segs.push(TitleSeg {
+                    text: format!(" ({cd})"),
+                    bg: None,
+                });
+            }
+        }
         let sep = match fmt {
             TitleFormat::Long => "  ·  ",
             TitleFormat::Medium => " · ",
@@ -2440,6 +2548,14 @@ fn title_segments(
             text: format!("{:.0}%", seven),
             bg: bg_for(seven),
         });
+        if show_remaining {
+            if let Some(cd) = short_countdown(seven_day_reset(s)) {
+                segs.push(TitleSeg {
+                    text: format!(" ({cd})"),
+                    bg: None,
+                });
+            }
+        }
     } else {
         let between = match fmt {
             TitleFormat::Long => "     ",
@@ -2476,6 +2592,14 @@ fn title_segments(
                         text: format!("{:.0}%", five),
                         bg: bg_for(five),
                     });
+                    if show_remaining {
+                        if let Some(cd) = short_countdown(five_hour_reset(s)) {
+                            segs.push(TitleSeg {
+                                text: format!(" ({cd})"),
+                                bg: None,
+                            });
+                        }
+                    }
                     segs.push(TitleSeg {
                         text: if matches!(fmt, TitleFormat::Long) {
                             "  ·  ".into()
@@ -2492,12 +2616,28 @@ fn title_segments(
                         text: format!("{:.0}%", seven),
                         bg: bg_for(seven),
                     });
+                    if show_remaining {
+                        if let Some(cd) = short_countdown(seven_day_reset(s)) {
+                            segs.push(TitleSeg {
+                                text: format!(" ({cd})"),
+                                bg: None,
+                            });
+                        }
+                    }
                 }
                 TitleFormat::Compact => {
                     segs.push(TitleSeg {
                         text: format!("{:.0}", five),
                         bg: bg_for(five),
                     });
+                    if show_remaining {
+                        if let Some(cd) = short_countdown(five_hour_reset(s)) {
+                            segs.push(TitleSeg {
+                                text: format!("({cd})"),
+                                bg: None,
+                            });
+                        }
+                    }
                     segs.push(TitleSeg {
                         text: "·".into(),
                         bg: None,
@@ -2506,6 +2646,14 @@ fn title_segments(
                         text: format!("{:.0}", seven),
                         bg: bg_for(seven),
                     });
+                    if show_remaining {
+                        if let Some(cd) = short_countdown(seven_day_reset(s)) {
+                            segs.push(TitleSeg {
+                                text: format!("({cd})"),
+                                bg: None,
+                            });
+                        }
+                    }
                 }
             }
         }
@@ -2513,13 +2661,60 @@ fn title_segments(
     segs
 }
 
-fn format_title(fmt: TitleFormat, snaps: &[UsageSnapshot]) -> String {
+fn format_title(fmt: TitleFormat, snaps: &[UsageSnapshot], show_remaining: bool) -> String {
     // Format preview in the style picker doesn't need preferred-browser filter;
     // it shows what the title would look like for the full data set.
-    title_segments(fmt, snaps, None)
+    title_segments(fmt, snaps, None, show_remaining)
         .into_iter()
         .map(|s| s.text)
         .collect()
+}
+
+/// Compact remaining-time tag ("3d4h", "1h12m", "45m"): 2 units max, minutes
+/// only below day scale, since `reset_suffix`'s hour-only bucketing is too
+/// coarse for planning a window's tail.
+///
+/// Returns `None` past the deadline — otherwise a stale cached utilization
+/// sits next to a "resets soon" countdown after the window already reset,
+/// reading as still-blocked.
+fn short_countdown(at: Option<DateTime<chrono::Utc>>) -> Option<String> {
+    let t = at?;
+    let delta = t.signed_duration_since(chrono::Utc::now());
+    if delta.num_seconds() <= 0 {
+        return None;
+    }
+    let days = delta.num_days();
+    let hours = delta.num_hours() - days * 24;
+    let mins = delta.num_minutes() - delta.num_hours() * 60;
+    Some(if days > 0 {
+        if hours > 0 {
+            format!("{days}d{hours}h")
+        } else {
+            format!("{days}d")
+        }
+    } else if hours > 0 {
+        if mins > 0 {
+            format!("{hours}h{mins}m")
+        } else {
+            format!("{hours}h")
+        }
+    } else {
+        format!("{}m", delta.num_minutes().max(1))
+    })
+}
+
+fn five_hour_reset(s: &UsageSnapshot) -> Option<DateTime<chrono::Utc>> {
+    s.usage
+        .as_ref()
+        .and_then(|u| u.five_hour.as_ref())
+        .and_then(|w| w.resets_at)
+}
+
+fn seven_day_reset(s: &UsageSnapshot) -> Option<DateTime<chrono::Utc>> {
+    s.usage
+        .as_ref()
+        .and_then(|u| u.seven_day.as_ref())
+        .and_then(|w| w.resets_at)
 }
 
 fn reset_suffix(at: Option<DateTime<chrono::Utc>>) -> String {
@@ -2783,8 +2978,53 @@ mod macos_title {
 
 #[cfg(test)]
 mod tests {
-    use super::reset_suffix;
+    use super::{reset_suffix, short_countdown};
     use chrono::{Duration, Utc};
+
+    #[test]
+    fn short_countdown_buckets() {
+        // Same determinism buffer as reset_suffix_buckets: a generous extra
+        // minute absorbs the gap between `Utc::now()` here and inside the
+        // function under test.
+        let buf = Duration::minutes(1);
+        let now = Utc::now();
+
+        // days + hours (7d window): minutes dropped at day scale
+        let s = short_countdown(Some(now + Duration::days(6) + Duration::hours(23) + buf));
+        assert_eq!(s.as_deref(), Some("6d23h"));
+
+        // exact day boundary: no dangling "0h"
+        let s = short_countdown(Some(now + Duration::days(3) + buf));
+        assert_eq!(s.as_deref(), Some("3d"));
+
+        // hours + minutes: minute precision even above 2h (unlike reset_suffix)
+        let s = short_countdown(Some(now + Duration::hours(4) + Duration::minutes(59) + buf));
+        assert_eq!(s.as_deref(), Some("4h59m"));
+
+        // hours + minutes below the hour+2 mark (extra 30s so the minute
+        // survives the flooring between this now and the one inside)
+        let s = short_countdown(Some(
+            now + Duration::hours(2) + Duration::minutes(1) + Duration::seconds(30),
+        ));
+        assert_eq!(s.as_deref(), Some("2h1m"));
+        let s = short_countdown(Some(now + Duration::hours(2) + Duration::seconds(30)));
+        assert_eq!(s.as_deref(), Some("2h"));
+
+        // sub-hour: minutes only
+        let s = short_countdown(Some(now + Duration::minutes(45) + Duration::seconds(15)));
+        assert_eq!(s.as_deref(), Some("45m"));
+
+        // sub-minute: floors to 1m, never "0m"
+        let s = short_countdown(Some(now + Duration::seconds(30)));
+        assert_eq!(s.as_deref(), Some("1m"));
+
+        // expired: hidden entirely — the stale percentage must not carry a
+        // countdown advertising a reset it doesn't reflect yet
+        assert_eq!(short_countdown(Some(now - Duration::minutes(5))), None);
+
+        // no timestamp: hidden
+        assert_eq!(short_countdown(None), None);
+    }
 
     #[test]
     fn reset_suffix_buckets() {
